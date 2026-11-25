@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
@@ -19,8 +20,12 @@ API = "https://api.github.com/repos/" + REPO
 WORKER = "coverage-standby-worker.yaml"
 WORKER_REF = "main"
 ENTRY = ".github/workflows/entrypoint.yaml"
+# Kept in sync with coverage_pr_entry.py by the admission contract tests.
+CACHE_BASE_REFS = frozenset({"main"})
 POOLS = {"cs": "cs-node-cache-7c14g", "idc": "amd64-mo-shanghai-ut-safe"}
 WAIT = 3600
+PROGRESS_INTERVAL = 300
+JOB_DETAIL_INTERVAL = 120
 HANDOFF_POLLS = 60
 HANDOFF_POLL_SECONDS = 5
 
@@ -60,6 +65,38 @@ def digest(nonce):
 
 def title(t, pool):
     return "Coverage standby / {parent}/{attempt}/{group}/{head}/".format(**t) + pool + "/" + t["key"]
+
+
+def short_title(t):
+    return f"GROUP{t['group']}"
+
+
+IDENTITY_SUFFIX = " / Run identity"
+
+
+class WorkerIdentityPending(ValueError):
+    pass
+
+
+def identity_title(r, m):
+    display = m["display_title"]
+    if not re.fullmatch(r"GROUP[01]", display):
+        return display
+    data = one(f"/actions/runs/{r}/attempts/1/jobs?per_page=100")
+    check(len(data["jobs"]) == data["total_count"], "incomplete worker identity response")
+    marked = [j for j in data["jobs"] if j["name"].endswith(IDENTITY_SUFFIX)]
+    if not marked:
+        raise WorkerIdentityPending("worker identity is not indexed")
+    check(len(marked) == 1, "ambiguous worker identity")
+    marker = marked[0]
+    check(marker["run_id"] == r and marker["run_attempt"] == 1, "invalid worker identity marker")
+    canonical = marker["name"][:-len(IDENTITY_SUFFIX)]
+    check(canonical.split("/")[3:4] == [display[-1]], "worker identity group differs from title")
+    if marker["status"] in ("queued", "requested", "pending", "waiting", "in_progress") and marker["conclusion"] is None:
+        raise WorkerIdentityPending("worker identity marker has not completed")
+    check(marker["status"] == "completed" and marker["conclusion"] == "skipped",
+          "invalid worker identity marker")
+    return canonical
 
 
 PARENT_POLLS = 13
@@ -204,8 +241,11 @@ def child_meta(r, t, pool, revision):
     m = run(r)
     check(m["id"] == r and m["repository"]["full_name"] == REPO and m["run_attempt"] == 1
           and m["path"] == ".github/workflows/" + WORKER and m["event"] == "workflow_dispatch"
-          and m["head_branch"] == WORKER_REF
-          and m["display_title"] == title(t, pool), "dedicated worker identity mismatch")
+          and m["head_branch"] == WORKER_REF, "dedicated worker identity mismatch")
+    canonical = identity_title(r, m)
+    check(canonical == title(t, pool) and (m["display_title"] == canonical
+          or (t.get("title_version") == 2 and m["display_title"] == short_title(t))),
+          "dedicated worker identity mismatch")
     actual = m["head_sha"]
     check(re.fullmatch("[a-f0-9]{40}", actual), "invalid worker revision")
     if actual != revision:
@@ -258,21 +298,46 @@ def decide(job, now, since):
 def dispatch(t, pool, revision):
     parent_meta(t)
     # At most one POST. If the response is lost, fail closed; no blind retries.
-    body, _ = api(f"/actions/workflows/{WORKER}/dispatches", {
-        "ref": WORKER_REF, "inputs": {"ticket": json.dumps(t, separators=(",", ":")),
-                                 "pool": pool}})
+    body, dispatched_at = api(f"/actions/workflows/{WORKER}/dispatches", {
+        "ref": WORKER_REF, "return_run_details": True,
+        "inputs": {"ticket": json.dumps(t, separators=(",", ":")), "pool": pool}})
     r = body.get("workflow_run_id")
+    check(r is None or (type(r) is int and r > 0), "invalid dispatch run ID")
+    # A plain GROUP0/GROUP1 is shared across PRs. The dispatch time bound is
+    # just a discovery filter; always compare the full identity below.
+    recent = datetime.fromtimestamp(dispatched_at - 60, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     for _ in range(24):
         if not r:  # also support a legacy 204 response, correlated without guessing
             page = one(f"/actions/workflows/{WORKER}/runs?" + urlencode(
-                dict(event="workflow_dispatch", branch=WORKER_REF, per_page=100)))
-            ids = [x["id"] for x in page["workflow_runs"] if x["display_title"] == title(t, pool)]
+                dict(event="workflow_dispatch", branch=WORKER_REF, created=f">={recent}", per_page=100)))
+            ids = []
+            for candidate in page["workflow_runs"]:
+                display = candidate["display_title"]
+                if display == title(t, pool):
+                    ids.append(candidate["id"])
+                elif t.get("title_version") == 2 and display == short_title(t):
+                    try:
+                        if identity_title(candidate["id"], candidate) == title(t, pool):
+                            ids.append(candidate["id"])
+                    except urllib.error.HTTPError as error:
+                        if error.code != 404:
+                            raise
+                        error.close()
+                    except WorkerIdentityPending:
+                        # A display name cannot identify a worker. Ignore an
+                        # unindexed run on this scan; it cannot block an exact
+                        # ticket match or receive a grant by itself.
+                        continue
             check(len(ids) <= 1, "duplicate dispatch; refusing to select")
             r = ids[0] if ids else None
         if r:
-            child_meta(r, t, pool, revision)
-            print(f"{pool} group {t['group']}: https://github.com/{REPO}/actions/runs/{r}", flush=True)
-            return r
+            try:
+                child_meta(r, t, pool, revision)
+            except WorkerIdentityPending:
+                pass
+            else:
+                print(f"{pool} group {t['group']}: https://github.com/{REPO}/actions/runs/{r}", flush=True)
+                return r
         time.sleep(5)
     raise ValueError("dispatch not reconciled; inspect Actions before retrying")
 
@@ -317,7 +382,7 @@ def choose():
     attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
     check(0 < attempt < 1_000_000, "invalid parent attempt")
     t = dict(parent=int(os.environ["GITHUB_RUN_ID"]), attempt=attempt, group=int(os.environ["GROUP"]),
-             head=os.environ["HEAD"], source=os.environ["SOURCE"], pr=int(os.environ["PR"]))
+             head=os.environ["HEAD"], source=os.environ["SOURCE"], pr=int(os.environ["PR"]), title_version=2)
     check(t["group"] in (0, 1) and re.fullmatch("[a-f0-9]{40}", t["head"]), "invalid input")
     parent_meta(t)
     if attempt > 1:
@@ -329,13 +394,18 @@ def choose():
     # reports the workflow branch head. These are not the same commit.
     pool = "cs"
     r, rev, nonce = reserve(t, pool)
+    print(f"Group {t['group']}: requesting a CS runner — {run_url(r)}", flush=True)
     since = None
+    last_queue_report = None
     while True:
         j, now = observe(r, t, "cs")
         route, since = decide(j, now, since)
         if route:
             print(f"group={t['group']} CS_job={j['id']} first_queued_utc={since} decision_utc={now} route={route}", flush=True)
             break
+        if since is not None and (last_queue_report is None or now - last_queue_report >= PROGRESS_INTERVAL):
+            print(f"Group {t['group']}: queued for a CS runner ({int(max(0, now - since))}s) — {run_url(r)}", flush=True)
+            last_queue_report = now
         time.sleep(30)
     if route == "idc":
         # A concurrently assigned CS worker is still blocked at admit: its nonce
@@ -365,6 +435,7 @@ def choose():
                 raise ValueError("CS cancellation not confirmed; IDC not dispatched")
             pool = "idc"
             r, rev, nonce = reserve(t, pool)
+            print(f"Group {t['group']}: switched to Shanghai standby — {run_url(r)}", flush=True)
     # Grant is immutable and costs no extra control token on the worker. Until
     # this point neither pool has been authorized to check out or run PR code.
     parent_meta(t)
@@ -409,7 +480,7 @@ def require_previous_grants_terminal(t):
                 continue
             m = run(int(found[1]))
             fields = re.fullmatch(r"Coverage standby / ([1-9][0-9]*)/([1-9][0-9]*)/([01])/"
-                                  r"([0-9a-f]{40})/(cs|idc)/[0-9a-f]{64}", m["display_title"])
+                                  r"([0-9a-f]{40})/(cs|idc)/[0-9a-f]{64}", identity_title(int(found[1]), m))
             check(fields and fields[1] == str(t["parent"]) and fields[4] == t["head"]
                   and m["path"] == ".github/workflows/" + WORKER and m["event"] == "workflow_dispatch"
                   and m["repository"]["full_name"] == REPO and m["head_branch"] == WORKER_REF,
@@ -438,7 +509,15 @@ def admit():
           "invalid worker ticket")
     parent_meta(t)
     check(re.fullmatch("[a-f0-9]{40}", t["revision"]), "invalid dispatch revision")
-    child_meta(r, t, pool, t["revision"])
+    for _ in range(12):
+        try:
+            child_meta(r, t, pool, t["revision"])
+            break
+        except WorkerIdentityPending:
+            parent_meta(t)
+            time.sleep(5)
+    else:
+        raise ValueError("worker identity is unavailable; no PR code executed")
     for _ in range(108):
         parent_meta(t)
         g = artifact(t["parent"], f"coverage-admit-{r}", "grant.json")
@@ -452,13 +531,20 @@ def admit():
     proof = artifact(t["parent"], proof_name(t),
                      "real-pr-authorization.json")
     pr = one(f"/pulls/{int(t['pr'])}")
-    check(proof and proof["allowed"] == "true" and proof["verified_membership_http_status"] == 204
+    # In-flight receipts from the old entrypoint retain their original
+    # eligibility. New receipts bind the exact base and allow Draft PRs
+    # independently of type labels.
+    schema = proof.get("schema", 1) if proof else None
+    base = proof.get("base_ref", "main" if schema == 1 else None) if proof else None
+    check(proof and schema in (1, 2) and proof["allowed"] == "true" and proof["verified_membership_http_status"] == 204
           and int(proof["pr_number"]) == pr["number"] and proof["author"] == pr["user"]["login"]
           and proof["head_repository"] == source == pr["head"]["repo"]["full_name"]
           and proof["head_sha"] == head == pr["head"]["sha"] and pr["state"] == "open"
-          and not pr["draft"] and not pr["head"]["repo"]["archived"]
-          and pr["base"]["repo"]["full_name"] == REPO and pr["base"]["ref"] == "main"
-          and "kind/test-ci" in {v["name"] for v in pr["labels"]}, "PR no longer matches authorization")
+          and not pr["head"]["repo"]["archived"]
+          and pr["base"]["repo"]["full_name"] == REPO
+          and pr["base"]["ref"] == base and base in CACHE_BASE_REFS
+          and (schema == 2 or (not pr["draft"] and "kind/test-ci" in {v["name"] for v in pr["labels"]})),
+          "PR no longer matches authorization")
     # The selector can fail while the parent run remains active. Check the
     # exact selector again before the worker loads PR code.
     parent_meta(t, require_selector=True)
@@ -497,13 +583,66 @@ def revoke():
         time.sleep(2)
 
 
+def run_url(r):
+    return f"https://github.com/{REPO}/actions/runs/{r}"
+
+
+def worker_progress(r, group, pool):
+    target, _ = observe(r, {"group": group}, pool)
+    if not target:
+        return "waiting for the worker job", run_url(r)
+    # Print only known phase text and canonical numeric URLs. Never relay output
+    # from PR code into the trusted hosted dispatcher.
+    url = f"{run_url(r)}/job/{int(target['id'])}"
+    runner = target.get("runner_name") or ""
+    site = None
+    if assigned(target, "cs"):
+        site = runner.split("-")[1].upper()
+    elif assigned(target, "idc"):
+        site = "Shanghai IDC"
+    ut_step = {
+        "cs": "Run coverage unit tests",
+        "idc": "Run the reviewed Coverage UT group, cold build allowed",
+    }[pool]
+    ut = next((s.get("status") for s in (target.get("steps") or []) if s.get("name") == ut_step), None)
+    if target.get("status") == "completed":
+        phase = "worker job finished"
+    elif ut == "completed":
+        phase = "UT step finished; collecting results"
+    elif ut == "in_progress":
+        phase = "Coverage UT running (setup and tests)"
+    elif site:
+        phase = "runner assigned; preparing Coverage UT"
+    else:
+        phase = "waiting for a runner"
+    return (f"{site}: {phase}" if site else phase), url
+
+
 def wait():
     r = int(os.environ["CHILD"])
+    pool = os.environ["POOL"]
+    group = int(os.environ["GROUP"])
+    print(f"Group {group}: open worker for live UT logs — {run_url(r)}", flush=True)
+    previous = None
+    last_report = None
+    next_details = None
     while True:
         m = run(r)
         if m["status"] == "completed":
             check(m["run_attempt"] == 1 and m["conclusion"] == "success", "selected coverage group did not pass")
+            print(f"Group {group}: Coverage UT passed — {run_url(r)}", flush=True)
             return
+        now = time.monotonic()
+        if next_details is None or now >= next_details:
+            next_details = now + JOB_DETAIL_INTERVAL
+            try:
+                progress = worker_progress(r, group, pool)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                progress = ("worker details temporarily unavailable; still waiting", run_url(r))
+            if progress != previous or last_report is None or now - last_report >= PROGRESS_INTERVAL:
+                phase, url = progress
+                print(f"Group {group}: {phase} — {url}", flush=True)
+                previous, last_report = progress, now
         time.sleep(30)
 
 

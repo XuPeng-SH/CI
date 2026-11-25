@@ -6,6 +6,7 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 from scripts import coverage_standby as s
+from scripts.coverage_pr_entry import CACHE_BASE_REFS
 
 
 class ParentAdmission(unittest.TestCase):
@@ -231,7 +232,6 @@ class ParentAdmission(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError,'still not active'):
                         s.choose()
                     dispatch.assert_not_called()
-
     def test_real_grant_path_and_terminal_change_before_checkout(self):
         grant=dict(child=51,ticket=self.t,pool='cs',nonce='test-nonce')
         proof=dict(allowed='true',verified_membership_http_status=204,pr_number='32922',
@@ -394,6 +394,61 @@ class ParentAdmission(unittest.TestCase):
                             s.revoke()
                         self.assertEqual(api.call_count, 1 if scenario == 'cancel_denied' else 3)
                         self.assertEqual(sleep.call_count, 0 if scenario == 'cancel_denied' else 2)
+
+
+    def test_receipt_base_is_pinned_for_both_pools_and_retry(self):
+        self.assertEqual(s.CACHE_BASE_REFS, CACHE_BASE_REFS)
+        for attempt, pool in ((1, "cs"), (2, "idc")):
+            t = dict(self.t, attempt=attempt, group=attempt-1, title_version=2)
+            grant = dict(child=51, ticket=t, pool=pool, nonce="test-nonce")
+            child = dict(id=51, repository={"full_name": s.REPO}, run_attempt=1,
+                         path=".github/workflows/"+s.WORKER, event="workflow_dispatch",
+                         head_branch=s.WORKER_REF, head_sha=t["revision"], display_title=s.short_title(t))
+            marker = dict(run_id=51, run_attempt=1, status="completed", conclusion="skipped",
+                          name=s.title(t, pool)+s.IDENTITY_SUFFIX)
+            env = dict(TICKET=json.dumps(t), GROUP=str(t["group"]), HEAD=self.sha, SOURCE=self.src,
+                       POOL=pool, GITHUB_RUN_ATTEMPT="1", GITHUB_RUN_ID="51")
+            for schema, authorized, live, member, labels, draft, expected in (
+                    (2, "4.2-dev", "4.2-dev", 204, ["kind/refactor"], False, False),
+                    (2, "4.2-dev", "4.2-dev", 204, [], True, False),
+                    (2, "main", "main", 204, [], False, True),
+                    (2, "main", "main", 204, [], True, True),
+                    (2, "main", "main", 404, ["kind/test-ci"], True, False),
+                    (2, "4.2-dev", "main", 204, [], True, False),
+                    (2, "main", "4.2-dev", 204, [], True, False),
+                    (2, "4.1-dev", "4.1-dev", 204, [], True, False),
+                    (2, None, "main", 204, [], True, False),
+                    (1, None, "main", 204, ["kind/test-ci"], False, True),
+                    (1, None, "main", 204, ["kind/test-ci"], True, False),
+                    (1, None, "main", 204, [], False, False),
+                    (1, None, "4.2-dev", 204, ["kind/test-ci"], False, False)):
+                proof = dict(schema=schema, allowed="true", verified_membership_http_status=member, pr_number="32922",
+                             author="dev", head_repository=self.src, head_sha=self.sha)
+                if authorized is not None:
+                    proof["base_ref"] = authorized
+                pr = dict(number=32922, user={"login": "dev"},
+                          head={"repo": {"full_name": self.src, "archived": False}, "sha": self.sha},
+                          state="open", draft=draft, base={"repo": {"full_name": s.REPO}, "ref": live},
+                          labels=[{"name": label} for label in labels])
+                def read_run(run_id):
+                    return {42: dict(self.p, run_attempt=attempt, status="queued"), 51: child}[run_id]
+                def read(path):
+                    selector = self.selector(group=t["group"], run_attempt=attempt,
+                                             name=f"Matrixone UT Coverage execution / Route Coverage group {t['group']} / {s.short_title(t)}")
+                    return {f"/actions/runs/42/attempts/{attempt}/jobs?per_page=100&page=1": {"jobs": [selector]},
+                            "/actions/runs/51/attempts/1/jobs?per_page=100": {"total_count": 1, "jobs": [marker]},
+                            "/pulls/32922": pr}[path]
+                with self.subTest(attempt=attempt, pool=pool, schema=schema, authorized=authorized,
+                                  live=live, member=member, labels=labels, draft=draft), \
+                     patch.dict(os.environ, env), patch.object(s, "run", side_effect=read_run), \
+                     patch.object(s, "one", side_effect=read), \
+                     patch.object(s, "artifact", side_effect=[grant, proof]) as artifact:
+                    if expected:
+                        s.admit()
+                    else:
+                        with self.assertRaisesRegex(ValueError, "PR no longer matches authorization"):
+                            s.admit()
+                    self.assertEqual(artifact.call_args.args[1], s.proof_name(t))
 
 
 class Queue(unittest.TestCase):
@@ -579,3 +634,147 @@ class Queue(unittest.TestCase):
         self.assertNotIn('coverage_standby.py wait', collector)
         self.assertIn('actions: read', collector)
         self.assertGreater(85*60, s.WAIT)
+
+
+class Progress(unittest.TestCase):
+    def test_live_worker_link_and_known_phases(self):
+        for pool, runner, step, site in (
+                ("cs", "cs-jed-nc-n1-pr-v1-abc-runner-def", "Run coverage unit tests", "JED"),
+                ("idc", "amd64-mo-shanghai-ut-safe-abc-runner-def",
+                 "Run the reviewed Coverage UT group, cold build allowed", "Shanghai IDC")):
+            for status, phase in (("pending", "runner assigned; preparing Coverage UT"),
+                                  ("in_progress", "Coverage UT running (setup and tests)"),
+                                  ("completed", "UT step finished; collecting results")):
+                target = dict(id=312, runner_id=7, runner_name=runner, status="in_progress",
+                              steps=[dict(name=step, status=status)])
+                with self.subTest(pool=pool, status=status), patch.object(s, "observe", return_value=(target, 1)) as read:
+                    self.assertEqual(s.worker_progress(123, 1, pool),
+                                     (f"{site}: {phase}", f"https://github.com/{s.REPO}/actions/runs/123/job/312"))
+                    read.assert_called_once_with(123, {"group": 1}, pool)
+
+    def test_progress_is_best_effort_and_child_result_is_authoritative(self):
+        env = dict(CHILD="123", GROUP="1", POOL="cs")
+        for conclusion in ("success", "failure"):
+            with self.subTest(conclusion=conclusion), patch.dict(os.environ, env), \
+                 patch.object(s, "run", side_effect=[dict(status="in_progress"),
+                                                    dict(status="completed", run_attempt=1, conclusion=conclusion)]), \
+                 patch.object(s, "worker_progress", side_effect=OSError("do not print API details")), \
+                 patch.object(s.time, "sleep"), patch("builtins.print") as out:
+                if conclusion == "success":
+                    s.wait()
+                else:
+                    with self.assertRaisesRegex(ValueError, "selected coverage group did not pass"):
+                        s.wait()
+                self.assertIn("worker details temporarily unavailable", str(out.call_args_list))
+                self.assertNotIn("do not print API details", str(out.call_args_list))
+
+    def test_job_details_are_rate_limited_but_child_result_is_polled_each_time(self):
+        interval = s.JOB_DETAIL_INTERVAL
+        times = [0, interval-1, interval, interval+1]
+        finish = dict(status="completed", run_attempt=1, conclusion="success")
+        with patch.dict(os.environ, dict(CHILD="123", GROUP="1", POOL="cs")), \
+             patch.object(s, "run", side_effect=[dict(status="in_progress")]*len(times)+[finish]) as runs, \
+             patch.object(s.time, "monotonic", side_effect=times), patch.object(s.time, "sleep"), \
+             patch.object(s, "worker_progress", return_value=("running", s.run_url(123))) as details, \
+             patch("builtins.print"):
+            s.wait()
+        self.assertEqual(runs.call_count, len(times)+1)
+        self.assertEqual(details.call_count, 2)
+
+
+class ShortWorkerTitle(unittest.TestCase):
+    def setUp(self):
+        self.ticket = dict(pr=33174, parent=42, attempt=1, group=0, head="a"*40,
+                           key="c"*64, title_version=2)
+        self.meta = dict(id=51, repository={"full_name": s.REPO}, run_attempt=1,
+                         path=".github/workflows/"+s.WORKER, event="workflow_dispatch",
+                         head_branch=s.WORKER_REF, head_sha="b"*40,
+                         display_title="GROUP0")
+        self.marker = dict(run_id=51, run_attempt=1, status="completed", conclusion="skipped",
+                           name=s.title(self.ticket, "cs")+s.IDENTITY_SUFFIX)
+
+    def test_exact_identity_still_required(self):
+        self.assertEqual(s.short_title(self.ticket), "GROUP0")
+        self.assertEqual(s.short_title(dict(self.ticket, group=1)), "GROUP1")
+        for marker, match in ((self.marker, True),
+                              (dict(self.marker, run_id=52), False),
+                              (dict(self.marker, conclusion="success"), False),
+                              (dict(self.marker, name=s.title(dict(self.ticket, group=1), "cs")+s.IDENTITY_SUFFIX), False),
+                              (dict(self.marker, name=self.marker["name"].replace("c"*64, "e"*64)), False)):
+            with self.subTest(marker=marker), patch.object(s, "run", return_value=self.meta), \
+                 patch.object(s, "one", return_value=dict(total_count=1, jobs=[marker])):
+                if match:
+                    self.assertEqual(s.child_meta(51, self.ticket, "cs", "b"*40), self.meta)
+                else:
+                    with self.assertRaisesRegex(ValueError, "identity"):
+                        s.child_meta(51, self.ticket, "cs", "b"*40)
+        legacy = dict(self.meta, display_title=s.title(self.ticket, "cs"))
+        with patch.object(s, "run", return_value=legacy), patch.object(s, "one") as lookup:
+            self.assertEqual(s.child_meta(51, self.ticket, "cs", "b"*40), legacy)
+            lookup.assert_not_called()
+
+    def test_dispatch_reconciles_two_identical_human_titles(self):
+        other = dict(self.meta, id=52)
+        wrong_marker = dict(self.marker, run_id=52, name=s.title(dict(self.ticket, parent=43), "cs")+s.IDENTITY_SUFFIX)
+        def read(path):
+            if "/actions/workflows/" in path:
+                return {"workflow_runs": [other, self.meta]}
+            return {"total_count": 1, "jobs": [wrong_marker if "/52/" in path else self.marker]}
+        with patch.object(s, "parent_meta"), patch.object(s, "api", return_value=({}, 0)) as post, \
+             patch.object(s, "one", side_effect=read), patch.object(s, "run", return_value=self.meta):
+            self.assertEqual(s.dispatch(self.ticket, "cs", "b"*40), 51)
+            post.assert_called_once()
+
+    def test_dispatch_requests_run_id_and_checks_the_returned_worker(self):
+        with patch.object(s, "parent_meta"), patch.object(s, "api", return_value=({"workflow_run_id": 51}, 0)) as post, \
+             patch.object(s, "one", return_value={"total_count": 1, "jobs": [self.marker]}) as lookup, \
+             patch.object(s, "run", return_value=self.meta):
+            self.assertEqual(s.dispatch(self.ticket, "cs", "b"*40), 51)
+            post.assert_called_once()
+            self.assertIs(post.call_args.args[1]["return_run_details"], True)
+            lookup.assert_called_once_with("/actions/runs/51/attempts/1/jobs?per_page=100")
+
+    def test_dispatch_retries_a_queued_marker_for_the_returned_id(self):
+        queued = dict(self.marker, status="queued", conclusion=None)
+        with patch.object(s, "parent_meta"), patch.object(s, "api", return_value=({"workflow_run_id": 51}, 0)) as post, \
+             patch.object(s, "one", side_effect=[{"total_count": 1, "jobs": [m]} for m in (queued, self.marker)]), \
+             patch.object(s, "run", return_value=self.meta), patch.object(s.time, "sleep") as sleep:
+            self.assertEqual(s.dispatch(self.ticket, "cs", "b"*40), 51)
+            post.assert_called_once()
+            sleep.assert_called_once_with(5)
+        for changes in (dict(run_id=90), dict(run_attempt=2), dict(conclusion="success")):
+            with self.subTest(changes=changes), patch.object(s, "one", return_value={
+                     "total_count": 1, "jobs": [{**queued, **changes}]}):
+                with self.assertRaisesRegex(ValueError, "invalid worker identity marker") as err:
+                    s.identity_title(51, self.meta)
+                self.assertNotIsInstance(err.exception, s.WorkerIdentityPending)
+
+    def test_204_dispatch_ignores_unindexed_same_title_but_rejects_verified_duplicates(self):
+        other = dict(self.meta, id=52)
+        for state in ("missing", "queued", "vanished", "duplicate"):
+            def read(path):
+                if "/actions/workflows/" in path:
+                    return {"workflow_runs": [other, self.meta]}
+                if "/52/" in path:
+                    if state == "vanished":
+                        raise urllib.error.HTTPError(path, 404, "not found", None, None)
+                    if state == "missing":
+                        return {"total_count": 0, "jobs": []}
+                    marker = dict(self.marker, run_id=52)
+                    if state == "queued":
+                        marker.update(status="queued", conclusion=None)
+                    return {"total_count": 1, "jobs": [marker]}
+                return {"total_count": 1, "jobs": [self.marker]}
+
+            with self.subTest(state=state), patch.object(s, "parent_meta"), \
+                 patch.object(s, "api", return_value=({}, 0)) as post, patch.object(s, "one", side_effect=read), \
+                 patch.object(s, "run", return_value=self.meta) as metadata, patch.object(s.time, "sleep") as sleep:
+                if state == "duplicate":
+                    with self.assertRaisesRegex(ValueError, "duplicate dispatch"):
+                        s.dispatch(self.ticket, "cs", "b"*40)
+                    metadata.assert_not_called()
+                else:
+                    self.assertEqual(s.dispatch(self.ticket, "cs", "b"*40), 51)
+                    metadata.assert_called_once_with(51)
+                post.assert_called_once()
+                sleep.assert_not_called()

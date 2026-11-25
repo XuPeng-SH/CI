@@ -1,6 +1,7 @@
 """Production routing has its own tests; the measured consumer is immutable."""
 import copy
 import hashlib
+from http.client import IncompleteRead, RemoteDisconnected
 import json
 import os
 import subprocess
@@ -10,8 +11,9 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from urllib.error import HTTPError
 from unittest import mock
-from scripts.coverage_pr_entry import ENTRY, PROJECT, main, route
+from scripts.coverage_pr_entry import ENTRY, PROJECT, S3_FIXTURE_BLOBS, has_s3_fixture, main, route
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = "48edf24e44a888c1c4d57318c4eca7cbb310c6e7"
@@ -21,14 +23,15 @@ CALLER = (PROJECT, "pull_request_target", ENTRY)
 
 class EntryTest(unittest.TestCase):
     def setUp(self):
-        self.pr = {"number": 32871, "state": "open", "draft": False, "labels": [{"name": "kind/test-ci"}],
+        self.verify_fixture = mock.Mock(return_value=True)
+        self.pr = {"number": 32871, "state": "open", "draft": False, "labels": [{"name": "size/XL"}],
                    "base": {"repo": {"full_name": PROJECT}, "ref": "main"},
                    "head": {"repo": {"full_name": "example/matrixone", "archived": False}, "sha": "a"*40},
                    "user": {"login": "example"}}
         self.event = {"number": 32871, "action": "synchronize", "pull_request": copy.deepcopy(self.pr)}
 
     def test_fork_and_source_are_bound_to_the_event(self):
-        out = route(CALLER, self.event, self.pr, 204)
+        out = route(CALLER, self.event, self.pr, 204, self.verify_fixture)
         self.assertEqual((out["head_sha"], out["head_repository"], out["route"]),
                          ("a"*40, "example/matrixone", "cache"))
         for target, key, value in [(self.pr["head"], "sha", "b"*40),
@@ -36,26 +39,114 @@ class EntryTest(unittest.TestCase):
                                    (self.pr, "state", "closed"), (self.pr, "number", 1)]:
             old = target[key]; target[key] = value
             with self.assertRaises(ValueError):
-                route(CALLER, self.event, self.pr, 204)
+                route(CALLER, self.event, self.pr, 204, self.verify_fixture)
             target[key] = old
 
     def test_unverified_requests_cannot_get_cache_runners(self):
         for status in (403, 401, 500):
             with self.assertRaises(ValueError):
-                route(CALLER, self.event, self.pr, status)
-        self.assertEqual(route(CALLER, self.event, self.pr, 404)["route"], "legacy")
-        self.assertEqual(route(CALLER, self.event, self.pr, 302)["route"], "legacy")
-        self.pr["labels"] = [{"name": "safe-to-test"}]
-        self.assertEqual(route(CALLER, self.event, self.pr, 204)["route"], "legacy")
+                route(CALLER, self.event, self.pr, status, self.verify_fixture)
+        self.assertEqual(route(CALLER, self.event, self.pr, 404, self.verify_fixture)["route"], "legacy")
+        self.assertEqual(route(CALLER, self.event, self.pr, 302, self.verify_fixture)["route"], "legacy")
+        for label in ("safe-to-test", "kind/test-ci"):
+            self.pr["labels"] = [{"name": label}]
+            self.assertEqual(route(CALLER, self.event, self.pr, 404, self.verify_fixture)["route"], "legacy")
         for ctx in [(PROJECT, "workflow_dispatch", ENTRY), (PROJECT, "pull_request", ENTRY),
                     ("example/matrixone", CALLER[1], ENTRY), (*CALLER[:2], ENTRY+"x")]:
             with self.assertRaises(ValueError):
-                route(ctx, self.event, self.pr, 204)
+                route(ctx, self.event, self.pr, 204, self.verify_fixture)
+
+    def test_only_main_is_an_eligible_target(self):
+        for base, expected in (("main", "cache"), ("4.2-dev", "legacy"),
+                               ("4.1-dev", "legacy"), ("4.2-dev-other", "legacy"),
+                               ("v4.2.8-hotfix", "legacy"), ("3.0-dev", "legacy")):
+            with self.subTest(base=base):
+                self.event["pull_request"]["base"]["ref"] = self.pr["base"]["ref"] = base
+                self.assertEqual(route(CALLER, self.event, self.pr, 204, self.verify_fixture)["route"], expected)
+        self.event["pull_request"]["base"]["ref"] = self.pr["base"]["ref"] = "4.2-dev"
+        self.assertEqual(route(CALLER, self.event, self.pr, 404, self.verify_fixture)["route"], "legacy")
+        self.event["pull_request"]["base"]["ref"] = self.pr["base"]["ref"] = "main"
+        for labels in ([], [{"name": "kind/refactor"}]):
+            self.pr["labels"] = labels
+            self.assertEqual(route(CALLER, self.event, self.pr, 204, self.verify_fixture)["route"], "cache")
+        self.pr["head"]["repo"]["archived"] = True
+        self.assertEqual(route(CALLER, self.event, self.pr, 204, self.verify_fixture)["route"], "legacy")
+        self.pr["head"]["repo"]["archived"] = False
+        self.pr["base"]["ref"] = "4.2-dev"
+        with self.assertRaisesRegex(ValueError, "stale or invalid PR identity"):
+            route(CALLER, self.event, self.pr, 204, self.verify_fixture)
+
+    def test_drafts_use_the_same_routing_and_identity_checks(self):
+        self.pr["draft"] = self.event["pull_request"]["draft"] = True
+        for base, member, expected in (("main", 204, "cache"), ("4.2-dev", 204, "legacy"),
+                                       ("main", 404, "legacy"), ("4.2-dev", 302, "legacy"),
+                                       ("4.1-dev", 204, "legacy")):
+            for action in ("opened", "synchronize"):
+                for labels in ([], [{"name": "kind/test-ci"}]):
+                    with self.subTest(base=base, member=member, action=action, labels=labels):
+                        self.event["action"] = action
+                        self.event["pull_request"]["base"]["ref"] = self.pr["base"]["ref"] = base
+                        self.pr["labels"] = labels
+                        self.assertEqual(route(CALLER, self.event, self.pr, member, self.verify_fixture)["route"], expected)
+        self.pr["base"]["ref"] = self.event["pull_request"]["base"]["ref"] = "main"
+        self.pr["head"]["repo"]["archived"] = True
+        self.assertEqual(route(CALLER, self.event, self.pr, 204, self.verify_fixture)["route"], "legacy")
+        self.pr["head"]["repo"]["archived"] = False
+        self.pr["head"]["sha"] = "b"*40
+        with self.assertRaisesRegex(ValueError, "stale or invalid PR identity"):
+            route(CALLER, self.event, self.pr, 204, self.verify_fixture)
+
+    def test_unlabelled_main_head_requires_reviewed_s3_fixture(self):
+        self.pr["labels"] = self.event["pull_request"]["labels"] = []
+        files = [{"type": "file", "name": name, "sha": sorted(shas)[0]}
+                 for name, shas in S3_FIXTURE_BLOBS.items()]
+        verify = lambda source, sha: has_s3_fixture(source, sha, "fixture-only")
+        for listing, expected in ((files[1:], "legacy"), (files, "cache"),
+                                  ([dict(files[0], sha="b"*40), *files[1:]], "legacy")):
+            with self.subTest(expected=expected), mock.patch("scripts.coverage_pr_entry.build_opener") as opener:
+                response = opener.return_value.open.return_value.__enter__.return_value
+                response.getheader.return_value = None
+                response.read.return_value = json.dumps(listing).encode()
+                self.assertEqual(route(CALLER, self.event, self.pr, 204, verify)["route"], expected)
+                request = opener.return_value.open.call_args.args[0]
+                self.assertEqual(request.full_url,
+                                 "https://api.github.com/repos/example/matrixone/contents/pkg/fileservice?ref=" + "a"*40)
+        with mock.patch("scripts.coverage_pr_entry.build_opener") as opener:
+            opener.return_value.open.side_effect = HTTPError("https://api.github.com", 404, "missing", {}, None)
+            self.assertEqual(route(CALLER, self.event, self.pr, 204, verify)["route"], "legacy")
+
+    def test_fixture_transport_errors_keep_legacy_route(self):
+        verify = lambda source, sha: has_s3_fixture(source, sha, "fixture-only")
+        for error in (RemoteDisconnected("peer closed the connection"), ConnectionResetError(),
+                      IncompleteRead(b"[", 10)):
+            with self.subTest(error=type(error).__name__), \
+                 mock.patch("scripts.coverage_pr_entry.build_opener") as opener:
+                open_request = opener.return_value.open
+                if isinstance(error, IncompleteRead):
+                    response = open_request.return_value.__enter__.return_value
+                    response.getheader.return_value = None
+                    response.read.side_effect = error
+                else:
+                    open_request.side_effect = error
+                self.assertEqual(route(CALLER, self.event, self.pr, 204, verify),
+                                 {"route": "legacy", "allowed": "false"})
+
+    def test_fixture_response_shorter_than_content_length_keeps_legacy_route(self):
+        files = [{"type": "file", "name": name, "sha": sorted(shas)[0]}
+                 for name, shas in S3_FIXTURE_BLOBS.items()]
+        raw = json.dumps(files).encode()
+        with mock.patch("scripts.coverage_pr_entry.build_opener") as opener:
+            response = opener.return_value.open.return_value.__enter__.return_value
+            response.read.return_value = raw
+            response.getheader.return_value = str(len(raw) + 10)
+            verify = lambda source, sha: has_s3_fixture(source, sha, "fixture-only")
+            self.assertEqual(route(CALLER, self.event, self.pr, 204, verify),
+                             {"route": "legacy", "allowed": "false"})
 
     def test_pr_number_does_not_pin_either_group(self):
         for i in range(1, 9):
             self.pr["number"] = self.event["number"] = self.event["pull_request"]["number"] = i
-            self.assertEqual(route(CALLER, self.event, self.pr, 204), {
+            self.assertEqual(route(CALLER, self.event, self.pr, 204, self.verify_fixture), {
                 "route":"cache", "allowed":"true", "head_sha":"a"*40, "head_repository":"example/matrixone"})
         wf = (ROOT/".github/workflows/coverage-ut.yaml").read_text()
         self.assertIn("      max-parallel: 2\n      matrix:\n        group:\n        - 0\n        - 1\n", wf)
@@ -91,23 +182,124 @@ class EntryTest(unittest.TestCase):
             env = dict(zip(("GITHUB_REPOSITORY", "GITHUB_EVENT_NAME", "GITHUB_WORKFLOW_REF"), CALLER))
             env.update(GITHUB_EVENT_PATH=str(root/"event"), GITHUB_OUTPUT=str(root/"outputs"), RUNNER_TEMP=tmp,
                        CS_PR_METADATA_TOKEN="fixture-only", CS_CACHE_READ_TOKEN="fixture-only")
-            with mock.patch.dict(os.environ, env, clear=True), mock.patch.dict(sys.modules, node_cache_real_pr_gate=client):
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.dict(sys.modules, node_cache_real_pr_gate=client), \
+                 mock.patch("scripts.coverage_pr_entry.has_s3_fixture", self.verify_fixture):
                 main()
+            self.verify_fixture.assert_called_once_with("example/matrixone", "a"*40, "fixture-only")
             self.assertIn("route=cache\n", (root/"outputs").read_text())
             raw = (root/"real-pr-authorization.json").read_text()
             self.assertNotIn("fixture-only", raw)
             receipt = json.loads(raw)
+            self.assertEqual(receipt["schema"], 2)
             self.assertEqual(receipt["head_sha"], self.pr["head"]["sha"])
+            self.assertEqual(receipt["base_ref"], self.pr["base"]["ref"])
             self.assertEqual(receipt["membership_checks"], checks)
+
+    def test_group_retry_uses_verified_head_and_rechecks_live_authorization(self):
+        workflows = ROOT / ".github/workflows"
+        parent = (workflows / "coverage-ut-standby.yaml").read_text()
+        handoff = (workflows / "coverage-queue-handoff.yaml").read_text()
+        self.assertIn("source: ${{ needs.check_coverage_eligibility.outputs.head_repository }}", parent)
+        self.assertIn("head: ${{ needs.check_coverage_eligibility.outputs.head_sha }}", parent)
+        self.assertIn("COVERAGE_ADMITTED_SOURCE: ${{ inputs.source }}", handoff)
+        self.assertIn("COVERAGE_ADMITTED_HEAD: ${{ inputs.head }}", handoff)
+        gate = handoff.split("name: Verify retry eligibility and pinned source", 1)[1]
+        gate = gate.split("      run: ", 1)[1].splitlines()[0]
+        source = self.pr["head"]["repo"]["full_name"]
+        head = self.pr["head"]["sha"]
+        for label, attempt, admitted_source, admitted_head, member, stale, allowed in (
+                ("same verified head", "2", source, head, 204, False, True),
+                ("different verified head", "2", source, "b"*40, 204, False, False),
+                ("different verified source", "2", "another/matrixone", head, 204, False, False),
+                ("missing verified source", "2", "", head, 204, False, False),
+                ("unverified membership", "2", source, head, 404, False, False),
+                ("first attempt", "1", source, head, 204, False, False),
+                ("stale event", "2", source, head, 204, True, False)):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "event").write_text(json.dumps(self.event))
+                live = copy.deepcopy(self.pr)
+                if stale:
+                    live["head"]["sha"] = "c"*40
+                client = SimpleNamespace(
+                    read=mock.Mock(return_value=(200, live)),
+                    membership=mock.Mock(return_value=(member, [])),
+                    c=SimpleNamespace(atomic_json=lambda path, obj: path.write_text(json.dumps(obj))),
+                )
+                env = dict(zip(("GITHUB_REPOSITORY", "GITHUB_EVENT_NAME", "GITHUB_WORKFLOW_REF"), CALLER))
+                env.update(GITHUB_EVENT_PATH=str(root / "event"), GITHUB_OUTPUT=str(root / "outputs"),
+                           RUNNER_TEMP=tmp, GITHUB_RUN_ATTEMPT=attempt, CS_PR_METADATA_TOKEN="fixture-only",
+                           CS_CACHE_READ_TOKEN="fixture-only", COVERAGE_ADMITTED_SOURCE=admitted_source,
+                           COVERAGE_ADMITTED_HEAD=admitted_head)
+                with mock.patch.dict(os.environ, env, clear=True), \
+                     mock.patch.dict(sys.modules, node_cache_real_pr_gate=client), \
+                     mock.patch("scripts.coverage_pr_entry.has_s3_fixture", return_value=False) as lookup:
+                    if stale:
+                        with self.assertRaisesRegex(ValueError, "stale or invalid PR identity"):
+                            main()
+                    else:
+                        main()
+                    lookup.assert_not_called()
+                client.read.assert_called_once()
+                client.membership.assert_called_once()
+                self.assertEqual((root / "real-pr-authorization.json").exists(), allowed)
+                if stale:
+                    self.assertFalse((root / "outputs").exists())
+                    continue
+                outputs = dict(line.split("=", 1) for line in (root / "outputs").read_text().splitlines())
+                gate_env = dict(os.environ, ALLOWED=outputs["allowed"], LIVE_HEAD=outputs.get("head_sha", ""),
+                                LIVE_SOURCE=outputs.get("head_repository", ""), HEAD=admitted_head,
+                                SOURCE=admitted_source)
+                self.assertEqual(subprocess.run(["bash", "-c", gate], env=gate_env).returncode,
+                                 0 if allowed else 1)
 
     def test_exact_measured_jobs_and_coverage_handoff(self):
         # Hash the complete three-job body from the measured immutable pin,
-        # after undoing ONLY the production entry wiring. No test/cache body edits.
+        # after undoing the production entry wiring and display-only diagnostics.
         path = ROOT/".github/workflows/coverage-ut.yaml"
         src = path.read_text()
         # Reconstruct the old job wrapper only to preserve the pre-existing measured-body digest.
         worker = (ROOT/".github/workflows/coverage-worker-cs.yaml").read_text()
         steps = "    - id: reader\n" + worker.split("    - id: reader\n", 1)[1]
+        # Undo only the review-time diagnostic reordering for the digest;
+        # production writes the compact summary before optional analysis.
+        marker_summary = (
+            '          python3 -I "$RUNNER_TEMP/coverage-summarize-ut-report.py" "${report}" \\\n'
+            '            --compact-output "$RUNNER_TEMP/ut-failure-compact.txt" | tee -a "${summary}" || true\n'
+        )
+        old_summary = ('          python "$GITHUB_WORKSPACE/.ci-workflow/scripts/summarize_ut_report.py" '
+                       '"${report}" | tee -a "${summary}" || true\n')
+        analysis_start = "    - name: Analyze and summarize failed coverage UT\n"
+        diagnostics_start = "    - name: Collect coverage UT runner diagnostics\n"
+        before, after = steps.split(analysis_start, 1)
+        analysis, after = after.split(diagnostics_start, 1)
+        self.assertEqual(analysis.count(marker_summary), 1)
+        summary_slot = "          fi\n        fi\n"
+        self.assertEqual(analysis.count(summary_slot), 1)
+        analysis = analysis.replace(marker_summary, "").replace(summary_slot, "          fi\n"+old_summary+"        fi\n")
+        steps = before + analysis_start + analysis + diagnostics_start + after
+        # Ignore diagnostic-only instrumentation, not the smoke command or
+        # its mandatory pass assertions, when comparing the measured body.
+        phase_setup = '        phase_failure="${RUNNER_TEMP}/ut-coverage-phase-failure.txt"\n        phase_name=configure_coverage\n'
+        self.assertEqual(steps.count(phase_setup), 1)
+        before, after = steps.split(phase_setup, 1)
+        steps = before + after.split('        trap \'record_unreported_phase_failure "$?"\' EXIT\n', 1)[1]
+        record = '          if [ "${phase_status}" != \'0\' ]; then\n            record_phase_failure "${phase_status}"\n          fi\n'
+        self.assertEqual(steps.count(record), 1)
+        steps = steps.replace(record, '').replace('} >> "${phase_failure}"', '} > "${phase_failure}"')
+        for phase in ("select_coverage_group", "configure_native_flags", "launch_coverage_suite"):
+            marker_phase = f"        phase_name={phase}\n"
+            self.assertEqual(steps.count(marker_phase), 1)
+            steps = steps.replace(marker_phase, "")
+        # The failure step may print diagnostics, but its condition, timeout,
+        # placement and final exit must match the measured worker.
+        marker = "    - name: Fail on coverage UT failure\n"
+        before_failure, failure = steps.split(marker, 1)
+        next_step = "    - name: Upload persistent tool recovery evidence\n"
+        failure, after_failure = failure.split(next_step, 1)
+        header, commands = failure.split("      run: |\n", 1)
+        self.assertTrue(commands.endswith("        exit 1\n"))
+        steps = before_failure + marker + header + "      run: exit 1\n" + next_step + after_failure
         steps = (steps.replace("inputs.group", "matrix.group")
                       .replace("inputs.source", "needs.check_coverage_eligibility.outputs.head_repository")
                       .replace("inputs.head", "needs.check_coverage_eligibility.outputs.head_sha"))

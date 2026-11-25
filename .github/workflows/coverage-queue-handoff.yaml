@@ -12,6 +12,7 @@ permissions:
   contents: read
 jobs:
   select:
+    name: GROUP${{ inputs.group }}
     if: github.workflow_ref == 'matrixorigin/matrixone/.github/workflows/entrypoint.yaml@refs/heads/main' && github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -47,6 +48,8 @@ jobs:
       env:
         CS_PR_METADATA_TOKEN: ${{ secrets.TOKEN_ACTION }}
         CS_CACHE_READ_TOKEN: ${{ secrets.CS_COVERAGE_CACHE_READ_TOKEN || github.token }}
+        COVERAGE_ADMITTED_SOURCE: ${{ inputs.source }}
+        COVERAGE_ADMITTED_HEAD: ${{ inputs.head }}
       run: PYTHONPATH="$GITHUB_WORKSPACE/reviewed/scripts" python3 scripts/coverage_pr_entry.py
     - if: github.run_attempt > 1
       name: Verify retry eligibility and pinned source
@@ -64,6 +67,7 @@ jobs:
         path: ${{ runner.temp }}/real-pr-authorization.json
         if-no-files-found: error
     - id: select
+      name: Find a CS runner or use Shanghai standby
       timeout-minutes: 85
       env:
         PR: ${{ github.event.pull_request.number }}
@@ -85,6 +89,8 @@ jobs:
       name: Wait for selected group, including its UT result
       env:
         CHILD: ${{ steps.select.outputs.child }}
+        POOL: ${{ steps.select.outputs.pool }}
+        GROUP: ${{ inputs.group }}
         ACTIONS_TOKEN: ${{ github.token }}
       run: python3 -I scripts/coverage_standby.py wait
     - name: Cancel the selected worker if the selector stops
@@ -99,6 +105,7 @@ jobs:
         ACTIONS_TOKEN: ${{ github.token }}
       run: python3 -I scripts/coverage_standby.py revoke
   collect:
+    name: Collect Group ${{ inputs.group }} coverage
     needs: select
     runs-on: ubuntu-latest
     timeout-minutes: 360
