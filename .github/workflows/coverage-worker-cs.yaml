@@ -20,8 +20,12 @@ jobs:
     name: Coverage reservation CS group ${{ inputs.group }}
     if: >-
       github.repository == 'matrixorigin/matrixone' && (inputs.group == 0 || inputs.group == 1) &&
-      ((github.event_name == 'workflow_dispatch' && github.workflow_ref == 'matrixorigin/matrixone/.github/workflows/coverage-standby-worker.yaml@refs/heads/main' && inputs.ticket != '') || (github.event_name == 'pull_request_target' && github.workflow_ref == 'matrixorigin/matrixone/.github/workflows/entrypoint.yaml@refs/heads/main' && inputs.ticket == ''))
-    runs-on: cs-node-cache-7c14g
+      ((github.event_name == 'workflow_dispatch' && github.workflow_ref == 'matrixorigin/matrixone/.github/workflows/coverage-standby-worker.yaml@refs/heads/main' && inputs.ticket != '') || (github.event_name == 'pull_request_target' && github.workflow_ref == 'matrixorigin/matrixone/.github/workflows/entrypoint.yaml@refs/heads/main' && inputs.ticket == '')) &&
+      (!fromJSON(inputs.ticket || '{}').site || contains(fromJSON('["mty","jed","mnl2","ruh"]'), fromJSON(inputs.ticket || '{}').site))
+    runs-on: >-
+      ${{ fromJSON(fromJSON(inputs.ticket || '{}').site &&
+      format('["cs-node-cache-7c14g","cs-{0}-node-cache-all"]', fromJSON(inputs.ticket || '{}').site) ||
+      '["cs-node-cache-7c14g"]') }}
     environment: ci
     timeout-minutes: 320
     steps:
@@ -34,6 +38,7 @@ jobs:
         sparse-checkout: |
           scripts/coverage_standby.py
           scripts/summarize_ut_report.py
+          scripts/coverage_cs_build_tools.sh
         sparse-checkout-cone-mode: false
         persist-credentials: false
     - name: Wait for an exclusive grant for this exact run before PR checkout
@@ -63,14 +68,7 @@ jobs:
         echo "site=$site" >> "$GITHUB_OUTPUT"
     - name: Install CS runner build dependencies
       timeout-minutes: 10
-      run: |
-        set -euo pipefail
-        if command -v gcc && command -v g++ && command -v make && command -v pkg-config && command -v cmake && command -v python; then
-          echo 'Build dependencies are already available.'
-        else
-          sudo apt-get -o Acquire::ForceIPv4=true update
-          sudo apt-get -o Acquire::ForceIPv4=true install -y build-essential cmake pkg-config python3 python-is-python3
-        fi
+      run: bash .standby/scripts/coverage_cs_build_tools.sh
     - name: Checkout MatrixOne source
       timeout-minutes: 10
       uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
