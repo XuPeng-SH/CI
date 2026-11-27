@@ -365,11 +365,15 @@ class WorkerDisplayTitleMismatch(ValueError):
     pass
 
 
+def is_worker_run(r, m):
+    return (m["id"] == r and m["repository"]["full_name"] == REPO and m["run_attempt"] == 1
+            and m["path"] == ".github/workflows/" + WORKER and m["event"] == "workflow_dispatch"
+            and m["head_branch"] == WORKER_REF)
+
+
 def child_meta(r, t, pool, revision):
     m = run(r)
-    check(m["id"] == r and m["repository"]["full_name"] == REPO and m["run_attempt"] == 1
-          and m["path"] == ".github/workflows/" + WORKER and m["event"] == "workflow_dispatch"
-          and m["head_branch"] == WORKER_REF, "dedicated worker identity mismatch")
+    check(is_worker_run(r, m), "dedicated worker identity mismatch")
     display = m.get("display_title")
     if display is None:
         raise WorkerDisplayTitleMismatch("dedicated worker identity mismatch: display title is missing")
@@ -498,8 +502,10 @@ def dispatch(t, pool, revision):
                         if identity_title(candidate["id"], candidate) == title(t, pool):
                             ids.append(candidate["id"])
                     except urllib.error.HTTPError as error:
-                        if error.code != 404:
+                        if error.code not in (404, 408) and not 500 <= error.code <= 599:
                             raise
+                        # This candidate may be another parent's worker. Only
+                        # an exact ticket match can move discovery forward.
                         error.close()
                     except WorkerIdentityPending:
                         # A display name cannot identify a worker. Ignore an
@@ -769,7 +775,32 @@ def check_grant_selector(t):
     return GRANT_SELECTOR_POLL_SECONDS, False
 
 
+def read_previous_grant(r, deadline):
+    """Resolve a receipt's worker before deciding whether its group can rerun."""
+    for poll in range(PARENT_POLLS):
+        try:
+            # Only the worker's first attempt can admit a grant. A later
+            # GitHub rerun changes the latest run without changing that receipt.
+            m = one(f"/actions/runs/{r}/attempts/1")
+            check(is_worker_run(r, m), "unrecognized previous grant; no redispatch")
+            return m, identity_title(r, m)
+        except WorkerIdentityPending as error:
+            reason = str(error)
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            error.close()
+            reason = "worker attempt or its jobs returned HTTP 404"
+        if poll + 1 == PARENT_POLLS or time.monotonic() + PARENT_POLL_SECONDS >= deadline:
+            break
+        time.sleep(PARENT_POLL_SECONDS)
+        if time.monotonic() >= deadline:
+            break
+    raise ValueError(f"previous grant worker {r} not verified: {reason}; no redispatch")
+
+
 def require_previous_grants_terminal(t):
+    deadline = time.monotonic() + PARENT_POLLS * PARENT_POLL_SECONDS
     page = 1
     while True:
         batch = one(f"/actions/runs/{t['parent']}/artifacts?per_page=100&page={page}")["artifacts"]
@@ -777,12 +808,10 @@ def require_previous_grants_terminal(t):
             found = re.fullmatch(r"coverage-admit-([1-9][0-9]*)", item["name"])
             if not found:
                 continue
-            m = run(int(found[1]))
+            m, canonical = read_previous_grant(int(found[1]), deadline)
             fields = re.fullmatch(r"Coverage standby / ([1-9][0-9]*)/([1-9][0-9]*)/([01])/"
-                                  r"([0-9a-f]{40})/(cs|idc)/[0-9a-f]{64}", identity_title(int(found[1]), m))
-            check(fields and fields[1] == str(t["parent"]) and fields[4] == t["head"]
-                  and m["path"] == ".github/workflows/" + WORKER and m["event"] == "workflow_dispatch"
-                  and m["repository"]["full_name"] == REPO and m["head_branch"] == WORKER_REF,
+                                  r"([0-9a-f]{40})/(cs|idc)/[0-9a-f]{64}", canonical)
+            check(fields and fields[1] == str(t["parent"]) and fields[4] == t["head"],
                   "unrecognized previous grant; no redispatch")
             if fields[3] == str(t["group"]):
                 check(m["status"] == "completed", "previously granted group still active; no redispatch")
