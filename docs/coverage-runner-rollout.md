@@ -3,8 +3,16 @@
 Set MatrixOne's `MO_COVERAGE_NATIVE` variable to the number of one PR
 targeting `main` or `4.2-dev` to run a canary. The other PRs use the pinned
 standby workflow. Preflight records the request for failed-jobs reruns.
-Clearing the variable sends fresh runs through standby. Keep the standby
-worker and completion cleanup until old runs have drained.
+The canary uses `coverage-ut-native.yaml` and fails if the selected head is
+ineligible. Clearing the variable sends fresh runs through standby. Keep the
+standby workflows, scripts and checks maintained through the production cutover
+and until their outstanding runs have drained.
+
+The canary reads `go.mod` at the authorized PR commit once. It selects the
+greater of the `go` and preferred `toolchain` versions and resolves a language
+version such as `go 1.26` to its first patch release (`go1.26.0`). Both Coverage
+groups and the 4.2 OSS/COS job use that exact toolchain for package listing,
+builds and tests. A failed-job rerun uses the original resolved version.
 
 ## Runner setup
 
@@ -23,10 +31,11 @@ Shanghai workers must satisfy the restricted UID, disk, sudo and socket checks.
   fetch concurrency, cache lifetime and Go checksum-service forwarding. Go
   toolchain misses use the same proxy with built-in verification. Use a
   single site-local `MO_COVERAGE_PIP_INDEX_URL` for jobs with Python UDFs.
-- Preload a Go bootstrap and the Go versions from both branches in the
-  runner tool cache. Populate the Python 3.12 tool cache, CGo build tools and
-  verified ONNX runtime. Publish images through the site's registry and measure
-  cold image pulls separately from job downloads.
+- Provide a Go bootstrap with toolchain selection on all three execution paths.
+  Preload the Go versions from both branches in PATH or in the runner tool
+  cache with its installation marker. Populate the Python 3.12 tool cache,
+  CGo build tools and verified ONNX runtime. Publish images through the site's
+  registry and measure cold image pulls separately from job downloads.
 - Mount only the site's prefix-scoped S3 test fixture at
   `/etc/matrixone-ci/coverage-s3` in the worker template. Provide the narrow
   `COVERAGE_PR_READ_TOKEN` credential with PR and organization membership read

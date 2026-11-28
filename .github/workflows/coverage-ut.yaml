@@ -13,10 +13,6 @@ on:
         required: false
         type: string
         default: ""
-      enable_4_2_dev:
-        description: "Enable native Coverage for the reviewed 4.2-dev fixtures"
-        type: boolean
-        default: false
     outputs:
       coverage_ready:
         description: "Whether the UT coverage profile was eligible to run"
@@ -25,7 +21,7 @@ on:
         description: "Terminal UT coverage producer status"
         value: ${{ jobs['coverage-final-status'].outputs.status || jobs.legacy.outputs.coverage_status }}
     secrets:
-      COVERAGE_PR_READ_TOKEN:
+      CS_COVERAGE_CACHE_READ_TOKEN:
         required: false
       TEST_S3FS_ALIYUN:
         description: "Object storage configuration for UT coverage"
@@ -48,16 +44,22 @@ on:
       S3BUCKET:
         description: "S3BUCKET For Test"
         required: false
+      CS_S3_MTY_CONFIG:
+        required: false
+      CS_S3_MNL2_CONFIG:
+        required: false
+      CS_S3_JED_CONFIG:
+        required: false
+      CS_S3_RUH_CONFIG:
+        required: false
       TOKEN_ACTION:
         description: "Token for checkout (e.g. pull from fork/private)"
         required: false
 
-permissions:
-  contents: read
-
 jobs:
   check_coverage_eligibility:
     runs-on: ubuntu-latest
+    environment: ci
     timeout-minutes: 5
     permissions:
       contents: read
@@ -85,12 +87,51 @@ jobs:
             config
           persist-credentials: false
       - id: entry
-        name: Authorize the live PR head for Coverage
+        name: Authorize the live PR head for the shared reader queue
         env:
-          CS_PR_METADATA_TOKEN: ${{ secrets.COVERAGE_PR_READ_TOKEN }}
-          CS_CACHE_READ_TOKEN: ${{ github.token }}
-          COVERAGE_ENABLE_4_2_DEV: ${{ inputs.enable_4_2_dev }}
+          CS_PR_METADATA_TOKEN: ${{ secrets.TOKEN_ACTION }}
+          CS_CACHE_READ_TOKEN: ${{ secrets.CS_COVERAGE_CACHE_READ_TOKEN || github.token }}
         run: PYTHONPATH="$GITHUB_WORKSPACE/reviewed/scripts" python3 entry/scripts/coverage_pr_entry.py
+      - id: check_coverage_secrets
+        if: steps.entry.outputs.route == 'cache'
+        name: Check coverage secrets
+        env:
+          CS_S3_MTY_CONFIG: ${{ secrets.CS_S3_MTY_CONFIG }}
+          CS_S3_MNL2_CONFIG: ${{ secrets.CS_S3_MNL2_CONFIG }}
+          CS_S3_JED_CONFIG: ${{ secrets.CS_S3_JED_CONFIG }}
+          CS_S3_RUH_CONFIG: ${{ secrets.CS_S3_RUH_CONFIG }}
+          IN_ORG: "1"
+          SAFE_LABEL: "0"
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in CS_S3_MTY_CONFIG CS_S3_MNL2_CONFIG CS_S3_JED_CONFIG CS_S3_RUH_CONFIG; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("${name}")
+            fi
+          done
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            if [ "${IN_ORG}" = '1' ] || [ "${SAFE_LABEL}" = '1' ]; then
+              echo "::error::CS runner S3 configurations must be set before enabling Coverage: ${missing[*]}"
+              exit 1
+            fi
+            echo "::notice::UT coverage skipped because required secrets are unavailable: ${missing[*]}"
+          fi
+      - name: Check durable cache grants before runner allocation
+        if: steps.entry.outputs.route == 'cache'
+        env:
+          CS_CACHE_READ_TOKEN: ${{ secrets.CS_COVERAGE_CACHE_READ_TOKEN || github.token }}
+        run: python3 reviewed/scripts/node_cache_native_pvc_catalog.py preflight
+      - name: Retain the authorized PR head receipt
+        if: steps.entry.outputs.route == 'cache'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: real-pr-snapshot-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/real-pr-authorization.json
+          if-no-files-found: error
   # For PRs outside the tested trust/base scope, keep the pre-cutover CI path.
   legacy:
     needs: check_coverage_eligibility
@@ -109,66 +150,35 @@ jobs:
       S3APISECRET: ${{ secrets.S3APISECRET }}
       S3BUCKET: ${{ secrets.S3BUCKET }}
   ut-coverage-linux-x86:
-    name: UT Coverage group ${{ matrix.group }}
-    needs: check_coverage_eligibility
-    if: needs.check_coverage_eligibility.outputs.allowed == 'true'
-    permissions:
-      contents: read
-      actions: read
-      pull-requests: read
+    name: UT Coverage group ${{ matrix.group }} on Ubuntu/x86
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
-        group: [0, 1]
-    uses: ./.github/workflows/coverage-worker.yaml
+        group:
+        - 0
+        - 1
+    needs: check_coverage_eligibility
+    if: needs.check_coverage_eligibility.outputs.allowed == 'true'
+    uses: ./.github/workflows/coverage-worker-cs.yaml
     with:
       group: ${{ matrix.group }}
       source: ${{ needs.check_coverage_eligibility.outputs.head_repository }}
       head: ${{ needs.check_coverage_eligibility.outputs.head_sha }}
-      enable_4_2_dev: ${{ inputs.enable_4_2_dev }}
-    secrets:
-      COVERAGE_PR_READ_TOKEN: ${{ secrets.COVERAGE_PR_READ_TOKEN }}
-  release-storage-coverage:
-    name: OSS and COS Coverage on Shanghai IDC
-    needs: check_coverage_eligibility
-    if: ${{ github.base_ref == '4.2-dev' && inputs.enable_4_2_dev && needs.check_coverage_eligibility.outputs.allowed == 'true' }}
-    permissions:
-      contents: read
-      pull-requests: read
-    uses: ./.github/workflows/coverage-release-storage.yaml
-    with:
-      source: ${{ needs.check_coverage_eligibility.outputs.head_repository }}
-      head: ${{ needs.check_coverage_eligibility.outputs.head_sha }}
-    secrets:
-      COVERAGE_PR_READ_TOKEN: ${{ secrets.COVERAGE_PR_READ_TOKEN }}
-      TEST_S3FS_ALIYUN: ${{ secrets.TEST_S3FS_ALIYUN }}
-      TEST_S3FS_QCLOUD: ${{ secrets.TEST_S3FS_QCLOUD }}
+    secrets: inherit
   merge-coverage-groups:
     needs:
     - check_coverage_eligibility
     - ut-coverage-linux-x86
-    - release-storage-coverage
-    if: ${{ !cancelled() && needs.ut-coverage-linux-x86.result == 'success' }}
+    if: ${{ needs.ut-coverage-linux-x86.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-    - id: validate_release_storage
-      name: Require the release provider profile
-      if: github.base_ref == '4.2-dev'
-      env:
-        STORAGE_RESULT: ${{ needs.release-storage-coverage.result }}
-        STORAGE_PROFILE: ${{ needs.release-storage-coverage.outputs.profile }}
-      run: |
-        set -euo pipefail
-        if [[ "$STORAGE_RESULT" != success || ! "$STORAGE_PROFILE" =~ ^[1-9][0-9]*$ ]]; then
-          echo '::error::Missing successful OSS and COS Coverage for this release PR'
-          exit 1
-        fi
     - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
       with:
         repository: matrixorigin/CI
         ref: c48984d3f9a6aff6179b28aa3e3d5466141a56b7
+        token: ${{ secrets.TOKEN_ACTION }}
         persist-credentials: false
         sparse-checkout: |
           scripts/coverage_group_collect.py
@@ -187,19 +197,10 @@ jobs:
       with:
         pattern: ut-coverage-group-*-generation-${{ github.run_id }}-*
         path: raw/profiles
-    - name: Download the selected release provider profile
-      if: github.base_ref == '4.2-dev'
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-      with:
-        artifact-ids: ${{ needs.release-storage-coverage.outputs.profile }}
-        path: raw/release-storage
-        merge-multiple: true
-    - id: merge_profiles
-      name: Validate complete package evidence and merge profiles
+    - name: Validate complete package evidence and merge profiles
       env:
         EXPECTED_HEAD_SHA: ${{ needs.check_coverage_eligibility.outputs.head_sha }}
         GROUP_COUNT: ${{ 2 }}
-        RELEASE_STORAGE_REQUIRED: ${{ github.base_ref == '4.2-dev' }}
       run: |
         set -euo pipefail
         test -n "$EXPECTED_HEAD_SHA"
@@ -213,11 +214,6 @@ jobs:
             tail -n +2 "selected/profiles/$group/ut-coverage.out" >> "$RUNNER_TEMP/ut-coverage.out"
           fi
         done
-        if [[ "$RELEASE_STORAGE_REQUIRED" == true ]]; then
-          storage_profile=raw/release-storage/ut-coverage.out
-          test "$(head -n 1 "$storage_profile")" = 'mode: set'
-          tail -n +2 "$storage_profile" >> "$RUNNER_TEMP/ut-coverage.out"
-        fi
         go run scripts/compact_coverage_profile.go "$RUNNER_TEMP/ut-coverage.out"
     - name: Upload combined UT coverage for existing consumer
       uses: matrixorigin/CI/actions/upload-artifact-with-retry@main

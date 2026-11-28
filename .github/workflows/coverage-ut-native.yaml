@@ -1,0 +1,221 @@
+name: MatrixOne native Coverage canary
+
+on:
+  workflow_call:
+    inputs:
+      bvt_generation:
+        description: "Shared CI generation used to select this run's coverage artifacts"
+        required: false
+        type: string
+        default: ""
+      enable_4_2_dev:
+        description: "Enable native Coverage for the reviewed 4.2-dev fixtures"
+        type: boolean
+        default: false
+    outputs:
+      coverage_ready:
+        description: "Whether the UT coverage profile was eligible to run"
+        value: ${{ jobs.check_coverage_eligibility.outputs.allowed }}
+      coverage_status:
+        description: "Terminal UT coverage producer status"
+        value: ${{ jobs['coverage-final-status'].outputs.status }}
+    secrets:
+      COVERAGE_PR_READ_TOKEN:
+        required: true
+      TEST_S3FS_ALIYUN:
+        description: "Object storage configuration for UT coverage"
+        required: false
+      TEST_S3FS_QCLOUD:
+        description: "Object storage configuration for UT coverage"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  check_coverage_eligibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      go_toolchain: ${{ steps.entry.outputs.go_toolchain }}
+      allowed: ${{ steps.entry.outputs.allowed }}
+      head_sha: ${{ steps.entry.outputs.head_sha }}
+      head_repository: ${{ steps.entry.outputs.head_repository }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: matrixorigin/CI
+          ref: ${{ job.workflow_sha }}
+          path: entry
+          sparse-checkout: |
+            scripts/coverage_pr_entry.py
+            scripts/coverage_native_entry.py
+            scripts/coverage_go_toolchain.go
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: matrixorigin/CI
+          ref: 7a8cf1854da5ca4cc5ffb5a1f2cbc454162ad589
+          path: reviewed
+          sparse-checkout: |
+            scripts
+            config
+          persist-credentials: false
+      - id: entry
+        name: Authorize the live PR head for Coverage
+        env:
+          CS_PR_METADATA_TOKEN: ${{ secrets.COVERAGE_PR_READ_TOKEN }}
+          CS_CACHE_READ_TOKEN: ${{ github.token }}
+          COVERAGE_ENABLE_4_2_DEV: ${{ inputs.enable_4_2_dev }}
+        run: PYTHONPATH="$GITHUB_WORKSPACE/reviewed/scripts" python3 entry/scripts/coverage_native_entry.py
+  ut-coverage-linux-x86:
+    name: UT Coverage group ${{ matrix.group }}
+    needs: check_coverage_eligibility
+    if: needs.check_coverage_eligibility.outputs.allowed == 'true'
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        group: [0, 1]
+    uses: ./.github/workflows/coverage-worker.yaml
+    with:
+      group: ${{ matrix.group }}
+      source: ${{ needs.check_coverage_eligibility.outputs.head_repository }}
+      head: ${{ needs.check_coverage_eligibility.outputs.head_sha }}
+      go_toolchain: ${{ needs.check_coverage_eligibility.outputs.go_toolchain }}
+      enable_4_2_dev: ${{ inputs.enable_4_2_dev }}
+    secrets:
+      COVERAGE_PR_READ_TOKEN: ${{ secrets.COVERAGE_PR_READ_TOKEN }}
+  release-storage-coverage:
+    name: OSS and COS Coverage on Shanghai IDC
+    needs: check_coverage_eligibility
+    if: ${{ github.base_ref == '4.2-dev' && inputs.enable_4_2_dev && needs.check_coverage_eligibility.outputs.allowed == 'true' }}
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/coverage-release-storage.yaml
+    with:
+      source: ${{ needs.check_coverage_eligibility.outputs.head_repository }}
+      head: ${{ needs.check_coverage_eligibility.outputs.head_sha }}
+      go_toolchain: ${{ needs.check_coverage_eligibility.outputs.go_toolchain }}
+    secrets:
+      COVERAGE_PR_READ_TOKEN: ${{ secrets.COVERAGE_PR_READ_TOKEN }}
+      TEST_S3FS_ALIYUN: ${{ secrets.TEST_S3FS_ALIYUN }}
+      TEST_S3FS_QCLOUD: ${{ secrets.TEST_S3FS_QCLOUD }}
+  merge-coverage-groups:
+    needs:
+    - check_coverage_eligibility
+    - ut-coverage-linux-x86
+    - release-storage-coverage
+    if: ${{ !cancelled() && needs.ut-coverage-linux-x86.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - id: validate_release_storage
+      name: Require the release provider profile
+      if: github.base_ref == '4.2-dev'
+      env:
+        STORAGE_RESULT: ${{ needs.release-storage-coverage.result }}
+        STORAGE_PROFILE: ${{ needs.release-storage-coverage.outputs.profile }}
+      run: |
+        set -euo pipefail
+        if [[ "$STORAGE_RESULT" != success || ! "$STORAGE_PROFILE" =~ ^[1-9][0-9]*$ ]]; then
+          echo '::error::Missing successful OSS and COS Coverage for this release PR'
+          exit 1
+        fi
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      with:
+        repository: matrixorigin/CI
+        ref: c48984d3f9a6aff6179b28aa3e3d5466141a56b7
+        persist-credentials: false
+        sparse-checkout: |
+          scripts/coverage_group_collect.py
+          scripts/coverage_two_groups_merge.py
+          scripts/compact_coverage_profile.go
+        sparse-checkout-cone-mode: false
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+        cache: false
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: ut-coverage-skips-group-*-${{ github.run_id }}-*
+        path: raw/groups
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: ut-coverage-group-*-generation-${{ github.run_id }}-*
+        path: raw/profiles
+    - name: Download the selected release provider profile
+      if: github.base_ref == '4.2-dev'
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ needs.release-storage-coverage.outputs.profile }}
+        path: raw/release-storage
+        merge-multiple: true
+    - id: merge_profiles
+      name: Validate complete package evidence and merge profiles
+      env:
+        EXPECTED_HEAD_SHA: ${{ needs.check_coverage_eligibility.outputs.head_sha }}
+        GROUP_COUNT: ${{ 2 }}
+        RELEASE_STORAGE_REQUIRED: ${{ github.base_ref == '4.2-dev' }}
+      run: |
+        set -euo pipefail
+        test -n "$EXPECTED_HEAD_SHA"
+        python3 scripts/coverage_group_collect.py --groups raw/groups --profiles raw/profiles --output selected --run-id "$GITHUB_RUN_ID" --group-count "$GROUP_COUNT"
+        python3 scripts/coverage_two_groups_merge.py selected/groups combined-skip-manifest.json --expected-sha "$EXPECTED_HEAD_SHA" --group-count "$GROUP_COUNT"
+        for ((group=0;group<GROUP_COUNT;group++)); do
+          test "$(head -n 1 "selected/profiles/$group/ut-coverage.out")" = 'mode: set'
+          if [ "$group" = 0 ]; then
+            cat "selected/profiles/$group/ut-coverage.out" > "$RUNNER_TEMP/ut-coverage.out"
+          else
+            tail -n +2 "selected/profiles/$group/ut-coverage.out" >> "$RUNNER_TEMP/ut-coverage.out"
+          fi
+        done
+        if [[ "$RELEASE_STORAGE_REQUIRED" == true ]]; then
+          storage_profile=raw/release-storage/ut-coverage.out
+          test "$(head -n 1 "$storage_profile")" = 'mode: set'
+          tail -n +2 "$storage_profile" >> "$RUNNER_TEMP/ut-coverage.out"
+        fi
+        go run scripts/compact_coverage_profile.go "$RUNNER_TEMP/ut-coverage.out"
+    - name: Upload combined UT coverage for existing consumer
+      uses: matrixorigin/CI/actions/upload-artifact-with-retry@main
+      with:
+        name: ut-coverage-generation-${{ inputs.bvt_generation || format('{0}-{1}', github.run_id, github.run_attempt) }}-attempt-${{ github.run_attempt
+          }}
+        path: ${{ runner.temp }}/ut-coverage.out
+        if-no-files-found: error
+        retention-days: 7
+    - name: Upload combined skip evidence
+      uses: actions/upload-artifact@v7
+      with:
+        name: ut-coverage-combined-skips-${{ github.run_id }}-${{ github.run_attempt }}
+        path: combined-skip-manifest.json
+        if-no-files-found: error
+        retention-days: 7
+  coverage-final-status:
+    needs:
+    - check_coverage_eligibility
+    - ut-coverage-linux-x86
+    - merge-coverage-groups
+    if: ${{ always() && !cancelled() && needs.check_coverage_eligibility.outputs.allowed == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.result.outputs.status }}
+    steps:
+    - id: result
+      env:
+        GROUP_RESULT: ${{ needs.ut-coverage-linux-x86.result }}
+        MERGE_RESULT: ${{ needs.merge-coverage-groups.result }}
+      run: |
+        if [ "$GROUP_RESULT" = success ] && [ "$MERGE_RESULT" = success ]; then
+          echo 'status=passed' >> "$GITHUB_OUTPUT"
+        else
+          echo 'status=failed' >> "$GITHUB_OUTPUT"
+        fi

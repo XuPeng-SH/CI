@@ -4,6 +4,7 @@ on:
     inputs:
       source: {type: string, required: true}
       head: {type: string, required: true}
+      go_toolchain: {type: string, required: true}
     outputs:
       profile:
         value: ${{ jobs.provider.outputs.profile }}
@@ -47,14 +48,16 @@ jobs:
             exit 1
           fi
         done
-    - if: github.run_attempt > 1
-      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
       timeout-minutes: 5
       with:
         repository: matrixorigin/CI
         ref: ${{ job.workflow_sha }}
         path: coverage-tools
-        sparse-checkout: scripts/coverage_pr_entry.py
+        sparse-checkout: |
+          scripts/coverage_pr_entry.py
+          scripts/coverage_native_entry.py
+          scripts/setup_coverage_go.sh
         sparse-checkout-cone-mode: false
         persist-credentials: false
     - if: github.run_attempt > 1
@@ -77,7 +80,7 @@ jobs:
         COVERAGE_EXPECTED_SOURCE: ${{ inputs.source }}
         COVERAGE_EXPECTED_HEAD: ${{ inputs.head }}
         COVERAGE_ENABLE_4_2_DEV: ${{ true }}
-      run: PYTHONPATH="$GITHUB_WORKSPACE/reviewed/scripts" python3 coverage-tools/scripts/coverage_pr_entry.py
+      run: PYTHONPATH="$GITHUB_WORKSPACE/reviewed/scripts" python3 coverage-tools/scripts/coverage_native_entry.py
     - name: Checkout authorized MatrixOne head
       uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
       timeout-minutes: 10
@@ -86,12 +89,12 @@ jobs:
         ref: ${{ inputs.head }}
         path: matrixone
         persist-credentials: false
-    - uses: matrixorigin/CI/actions/setup-env@5fc75d89bc2841e50ae1557d28ebd9aaec6ec3e2
-      timeout-minutes: 10
-      with:
-        setup-java: false
-        setup-cmake: false
-        go-version-file: matrixone/go.mod
+    - id: go_toolchain
+      name: Use the authorized Coverage Go toolchain
+      timeout-minutes: 5
+      env:
+        COVERAGE_GO_TOOLCHAIN: ${{ inputs.go_toolchain }}
+      run: bash coverage-tools/scripts/setup_coverage_go.sh "$COVERAGE_GO_TOOLCHAIN"
     - name: Prepare Coverage CGo libraries
       timeout-minutes: 30
       working-directory: matrixone

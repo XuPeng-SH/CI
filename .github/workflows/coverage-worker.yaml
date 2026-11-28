@@ -5,6 +5,7 @@ on:
       group: {type: number, required: true}
       source: {type: string, required: true}
       head: {type: string, required: true}
+      go_toolchain: {type: string, required: true}
       enable_4_2_dev: {type: boolean, default: false}
     secrets:
       COVERAGE_PR_READ_TOKEN: {required: true}
@@ -82,6 +83,8 @@ jobs:
         path: .coverage-control
         sparse-checkout: |
           scripts/coverage_pr_entry.py
+          scripts/coverage_native_entry.py
+          scripts/setup_coverage_go.sh
           scripts/summarize_ut_report.py
         sparse-checkout-cone-mode: false
         persist-credentials: false
@@ -105,9 +108,11 @@ jobs:
         COVERAGE_EXPECTED_SOURCE: ${{ inputs.source }}
         COVERAGE_EXPECTED_HEAD: ${{ inputs.head }}
         COVERAGE_ENABLE_4_2_DEV: ${{ inputs.enable_4_2_dev }}
-      run: PYTHONPATH="$GITHUB_WORKSPACE/.coverage-auth/scripts" python3 .coverage-control/scripts/coverage_pr_entry.py
-    - name: Preserve the trusted failure summary helper
-      run: install -m 0444 .coverage-control/scripts/summarize_ut_report.py "$RUNNER_TEMP/coverage-summarize-ut-report.py"
+      run: PYTHONPATH="$GITHUB_WORKSPACE/.coverage-auth/scripts" python3 .coverage-control/scripts/coverage_native_entry.py
+    - name: Preserve the trusted Coverage helpers
+      run: |
+        install -m 0444 .coverage-control/scripts/summarize_ut_report.py "$RUNNER_TEMP/coverage-summarize-ut-report.py"
+        install -m 0444 .coverage-control/scripts/setup_coverage_go.sh "$RUNNER_TEMP/setup-coverage-go.sh"
     - id: build_tools
       name: Check preinstalled native build tools
       run: |
@@ -150,32 +155,11 @@ jobs:
         set -euo pipefail
         python3 .ci-workflow/scripts/node_cache_toolchain_store.py --catalog .ci-workflow/config/node-compile-cache-catalog.json --lock .ci-workflow/config/node-toolchain-lock.json --destination "$RUNNER_TEMP/node-toolchain-install" --report "$RUNNER_TEMP/persistent-toolchain.json"
     - id: go_toolchain
-      name: Select the Go version declared by the source
+      name: Use the authorized Coverage Go toolchain
       timeout-minutes: 5
-      run: |
-        set -euo pipefail
-        module=$(env -u GOROOT GOTOOLCHAIN=local GOWORK=off go mod edit -json)
-        go_version=$(jq -r '.Go // ""' <<< "$module")
-        toolchain=auto
-        # Use a specified release as the default and let Go apply toolchain directives.
-        case "$go_version" in
-          *.*.*|*rc*|*beta*) toolchain="go${go_version}+auto" ;;
-        esac
-
-        # Go looks for versioned executables before consulting the module proxy.
-        tools=$(mktemp -d "$RUNNER_TEMP/coverage-go-bin.XXXXXXXX")
-        if [[ -n "${RUNNER_TOOL_CACHE:-}" ]]; then
-          for cached_go in "$RUNNER_TOOL_CACHE"/go/*/x64/bin/go; do
-            [[ -x "$cached_go" && -f "${cached_go%/bin/go}.complete" ]] || continue
-            version_dir=${cached_go%/x64/bin/go}
-            ln -s "$cached_go" "$tools/go${version_dir##*/}"
-          done
-        fi
-        selected=$(env -u GOROOT GOTOOLCHAIN="$toolchain" GOWORK=off PATH="$tools:$PATH" \
-          GOMODCACHE="$RUNNER_TEMP/coverage-go-toolchain" go env GOROOT)
-        test -x "$selected/bin/go"
-        printf 'GOROOT=%s\n' "$selected" >> "$GITHUB_ENV"
-        printf '%s/bin\n' "$selected" >> "$GITHUB_PATH"
+      env:
+        COVERAGE_GO_TOOLCHAIN: ${{ inputs.go_toolchain }}
+      run: bash "$RUNNER_TEMP/setup-coverage-go.sh" "$COVERAGE_GO_TOOLCHAIN"
     - name: Configure the site-local Python dependency mirror
       if: ${{ hashFiles('pkg/udf/python/worker/requirements.txt') != '' }}
       run: |
@@ -704,6 +688,7 @@ jobs:
         RUNNER_POOL: ${{ steps.reader.outputs.pool }}
         VERIFY_PR_OUTCOME: ${{ steps.verify_pr.outcome }}
         BUILD_TOOLS_OUTCOME: ${{ steps.build_tools.outcome }}
+        GO_TOOLCHAIN_OUTCOME: ${{ steps.go_toolchain.outcome }}
         NODE_CACHE_OUTCOME: ${{ steps.node_cache.outcome }}
         COVERAGE_OUTCOME: ${{ steps.coverage_ut.outcome }}
         PROFILE_UPLOAD_OUTCOME: ${{ steps.upload_coverage_profile.outcome }}
@@ -718,6 +703,8 @@ jobs:
             reason=pr_snapshot_verification_failure
           elif [[ "$BUILD_TOOLS_OUTCOME" == failure ]]; then
             reason=runner_build_dependencies_failure
+          elif [[ "$GO_TOOLCHAIN_OUTCOME" == failure ]]; then
+            reason=go_toolchain_setup_failure
           elif [[ "$NODE_CACHE_OUTCOME" == failure ]]; then
             reason=node_cache_configuration_failure
           else

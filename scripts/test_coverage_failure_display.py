@@ -12,9 +12,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-class CoverageFailureDisplayTest(unittest.TestCase):
+class CoverageFailureDisplayContract:
     def run_reporting_step(self, start, end, temp, env, preamble=""):
-        workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
+        workflow = self.workflow
         block = workflow.split(start, 1)[1].split(end, 1)[0]
         script = textwrap.dedent(block.split("      run: |\n", 1)[1])
         return subprocess.run(
@@ -24,8 +24,9 @@ class CoverageFailureDisplayTest(unittest.TestCase):
         )
 
     def run_failure_step(self, temp):
-        workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
+        workflow = self.workflow
         step = workflow.split("    - name: Fail on coverage UT failure\n", 1)[1]
+        step = step.split("\n    - ", 1)[0]
         script = textwrap.dedent(step.split("      run: |\n", 1)[1])
         return subprocess.run(["bash", "-e", "-c", script], env={**os.environ, "RUNNER_TEMP": str(temp)},
                               text=True, capture_output=True, check=False)
@@ -100,11 +101,10 @@ class CoverageFailureDisplayTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("jq"), "requires jq, installed on coverage runners")
     def test_status_keeps_the_first_failed_phase_and_fails_closed_on_its_own_checks(self):
-        defaults = dict(RUNNER_POOL="cs", VERIFY_PR_OUTCOME="success", BUILD_TOOLS_OUTCOME="success", NODE_CACHE_OUTCOME="success",
+        defaults = dict(BUILD_TOOLS_OUTCOME="success", NODE_CACHE_OUTCOME="success",
                         COVERAGE_OUTCOME="success", PROFILE_UPLOAD_OUTCOME="success", CACHE_ACCEPTANCE_OUTCOME="success")
+        defaults.update(self.admission_defaults)
         cases = (
-            (dict(VERIFY_PR_OUTCOME="failure", COVERAGE_OUTCOME="skipped", CACHE_ACCEPTANCE_OUTCOME="skipped"),
-             None, "failed", "pr_snapshot_verification_failure"),
             (dict(BUILD_TOOLS_OUTCOME="failure", COVERAGE_OUTCOME="skipped"),
              None, "failed", "runner_build_dependencies_failure"),
             (dict(NODE_CACHE_OUTCOME="failure", COVERAGE_OUTCOME="skipped", CACHE_ACCEPTANCE_OUTCOME="skipped"),
@@ -118,10 +118,9 @@ class CoverageFailureDisplayTest(unittest.TestCase):
              None, "failed", "coverage_profile_artifact_upload_failure"),
             (dict(CACHE_ACCEPTANCE_OUTCOME="failure"), None, "failed", "incremental_cache_validation_failure"),
             (dict(CACHE_ACCEPTANCE_OUTCOME="skipped"), None, "failed", "incremental_cache_validation_failure"),
-            (dict(RUNNER_POOL="idc", CACHE_ACCEPTANCE_OUTCOME="skipped"), None, "passed", "command_exit"),
             ({}, {"result": "passed", "reason": "command_exit"}, "passed", "command_exit"),
         )
-        for overrides, input_status, result, reason in cases:
+        for overrides, input_status, result, reason in cases + self.extra_cases:
             with self.subTest(overrides=overrides, result=result, reason=reason), tempfile.TemporaryDirectory() as folder:
                 temp = Path(folder)
                 path = temp / "ut-coverage-status.json"
@@ -145,7 +144,7 @@ class CoverageFailureDisplayTest(unittest.TestCase):
                 self.assertIn("No per-test skip evidence" if outcome == "failure" else "::error::", proc.stdout)
 
     def test_skip_manifest_is_still_required_and_uploaded_after_a_valid_report(self):
-        workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
+        workflow = self.workflow
         upload = workflow.split("    - name: Upload skip comparison evidence\n", 1)[1].split("    - id:", 1)[0]
         self.assertIn("steps.skip_manifest.outputs.available == 'true'", upload)
         self.assertIn("if-no-files-found: error", upload)
@@ -163,48 +162,10 @@ class CoverageFailureDisplayTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 9)
             self.assertFalse((temp / "output").exists())
 
-    def test_failure_evidence_keeps_the_first_error_and_bounds_uploads(self):
-        workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
-        with tempfile.TemporaryDirectory() as directory:
-            temp = Path(directory)
-            workspace = temp / "workspace"
-            (workspace / ".coverage-control").mkdir(parents=True)
-            (workspace / ".coverage-control/scripts").symlink_to(ROOT / "scripts", target_is_directory=True)
-            copy_step = "    - name: Preserve the trusted failure summary helper\n"
-            source_step = "    - name: Checkout MatrixOne source\n"
-            self.assertLess(workflow.index(copy_step), workflow.index(source_step))
-            copy_cmd = workflow.split(copy_step, 1)[1].split("      run: ", 1)[1].splitlines()[0]
-            subprocess.run(["bash", "-ec", copy_cmd], cwd=workspace,
-                           env={**os.environ, "RUNNER_TEMP": str(temp)}, check=True)
-            # Source checkout clears the old worktree.
-            shutil.rmtree(workspace)
-            workspace.mkdir()
-            (temp / "ut-coverage-report.json").write_text(json.dumps({
-                "Action": "fail", "Package": "example/pkg", "Test": "TestFailed"
-            }) + "\n")
-            stderr = temp / "ut-coverage.stderr.log"
-            stderr.write_text("noise\n" * 24000 + "last runner error\n")
-            (temp / "ut-coverage-cgo.log").symlink_to(stderr)
-            reports = self.run_reporting_step(
-                "    - name: Collect bounded Coverage failure evidence\n",
-                "    - id: upload_coverage_profile\n",
-                temp, dict(GITHUB_WORKSPACE=str(workspace)),
-                preamble="go() { exit 87; }\nsudo() { exit 88; }\n",
-            )
-            result = self.run_failure_step(temp)
-            bundle = temp / "coverage-failure"
-            self.assertEqual(reports.returncode, 0, reports.stderr)
-            self.assertEqual((bundle / stderr.name).stat().st_size, 65536)
-            self.assertTrue((bundle / stderr.name).read_text().endswith("last runner error\n"))
-            self.assertFalse((bundle / "ut-coverage-cgo.log").exists())
-            self.assertFalse((bundle / "ut-coverage-report.json").exists())
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("FAILED example/pkg / TestFailed", result.stdout)
-
     def test_actual_phase_producer_reports_timeouts_and_pre_report_failures(self):
-        workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
+        workflow = self.workflow
         step = workflow.split("    - id: coverage_ut\n", 1)[1]
-        script = textwrap.dedent(step.split("      run: |\n", 1)[1].split("    - name: Collect bounded Coverage failure evidence", 1)[0])
+        script = textwrap.dedent(step.split("      run: |\n", 1)[1].split("\n    - ", 1)[0])
         setup = script.split('cd "$GITHUB_WORKSPACE"', 1)[0]
         phases = "phase_start() {" + script.split("phase_start() {", 1)[1].split("\nphase_start discover_packages", 1)[0]
         for phase, code, command in (
@@ -234,3 +195,98 @@ class CoverageFailureDisplayTest(unittest.TestCase):
         self.assertEqual(result.stdout.count("Coverage UT: ::error::inert"), 16)
         self.assertNotIn("\r", result.stdout)
         self.assertFalse(any(line.startswith("::") for line in result.stdout.splitlines()))
+
+class CoverageFailureDisplayTest(CoverageFailureDisplayContract, unittest.TestCase):
+    workflow = (ROOT / ".github/workflows/coverage-worker-cs.yaml").read_text()
+    admission_defaults = dict(ADMISSION_OUTCOME="success")
+    extra_cases = (
+        (dict(ADMISSION_OUTCOME="failure", COVERAGE_OUTCOME="skipped", CACHE_ACCEPTANCE_OUTCOME="skipped"),
+         None, "failed", "worker_admission_failure"),
+    )
+
+    def test_compact_failure_is_ready_when_optional_tool_is_interrupted(self):
+        workflow = self.workflow
+        step = workflow.split("    - name: Analyze and summarize failed coverage UT\n", 1)[1]
+        step = step.split("    - name: Collect coverage UT runner diagnostics\n", 1)[0]
+        script = textwrap.dedent(step.split("      run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            workspace = temp / "workspace"
+            (workspace / ".standby").mkdir(parents=True)
+            (workspace / ".standby/scripts").symlink_to(ROOT / "scripts", target_is_directory=True)
+            copy_step = "    - name: Preserve the trusted failure summary helper\n"
+            source_step = "    - name: Checkout MatrixOne source\n"
+            self.assertLess(workflow.index(copy_step), workflow.index(source_step))
+            copy_cmd = workflow.split(copy_step, 1)[1].split("      run: ", 1)[1].splitlines()[0]
+            subprocess.run(["bash", "-ec", copy_cmd], cwd=workspace,
+                           env={**os.environ, "RUNNER_TEMP": str(temp)}, check=True)
+            # actions/checkout clears the root here because it has no root .git.
+            shutil.rmtree(workspace)
+            workspace.mkdir()
+            (temp / "ut-coverage-status.json").write_text('{"result":"failed"}')
+            (temp / "ut-coverage-report.json").write_text(json.dumps({
+                "Action": "fail", "Package": "example/pkg", "Test": "TestFailed"
+            }) + "\n")
+            # Simulate termination while attempting the optional install.
+            go_stub = 'go() { [[ -s "$RUNNER_TEMP/ut-failure-compact.txt" ]] || exit 97; exit 124; }\n'
+            interrupted = subprocess.run(
+                ["bash", "-e", "-c", go_stub + script],
+                env={**os.environ, "RUNNER_TEMP": str(temp), "GITHUB_WORKSPACE": str(workspace),
+                     "GITHUB_STEP_SUMMARY": str(temp / "summary.md")},
+                text=True, capture_output=True, check=False,
+            )
+            result = self.run_failure_step(temp)
+        self.assertEqual(interrupted.returncode, 124, interrupted.stderr)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAILED example/pkg / TestFailed", result.stdout)
+
+
+class NativeCoverageFailureDisplayTest(CoverageFailureDisplayContract, unittest.TestCase):
+    workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
+    admission_defaults = dict(RUNNER_POOL="cs", VERIFY_PR_OUTCOME="success", GO_TOOLCHAIN_OUTCOME="success")
+    extra_cases = (
+        (dict(VERIFY_PR_OUTCOME="failure", COVERAGE_OUTCOME="skipped", CACHE_ACCEPTANCE_OUTCOME="skipped"),
+         None, "failed", "pr_snapshot_verification_failure"),
+        (dict(GO_TOOLCHAIN_OUTCOME="failure", COVERAGE_OUTCOME="skipped", CACHE_ACCEPTANCE_OUTCOME="skipped"),
+         None, "failed", "go_toolchain_setup_failure"),
+        (dict(RUNNER_POOL="idc", CACHE_ACCEPTANCE_OUTCOME="skipped"), None, "passed", "command_exit"),
+    )
+
+    def test_failure_evidence_keeps_the_first_error_and_bounds_uploads(self):
+        workflow = self.workflow
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            workspace = temp / "workspace"
+            (workspace / ".coverage-control").mkdir(parents=True)
+            (workspace / ".coverage-control/scripts").symlink_to(ROOT / "scripts", target_is_directory=True)
+            copy_step = "    - name: Preserve the trusted Coverage helpers\n"
+            source_step = "    - name: Checkout MatrixOne source\n"
+            self.assertLess(workflow.index(copy_step), workflow.index(source_step))
+            copy_block = workflow.split(copy_step, 1)[1].split("\n    - ", 1)[0]
+            copy_cmd = textwrap.dedent(copy_block.split("      run: |\n", 1)[1])
+            subprocess.run(["bash", "-ec", copy_cmd], cwd=workspace,
+                           env={**os.environ, "RUNNER_TEMP": str(temp)}, check=True)
+            # Source checkout clears the old worktree.
+            shutil.rmtree(workspace)
+            workspace.mkdir()
+            (temp / "ut-coverage-report.json").write_text(json.dumps({
+                "Action": "fail", "Package": "example/pkg", "Test": "TestFailed"
+            }) + "\n")
+            stderr = temp / "ut-coverage.stderr.log"
+            stderr.write_text("noise\n" * 24000 + "last runner error\n")
+            (temp / "ut-coverage-cgo.log").symlink_to(stderr)
+            reports = self.run_reporting_step(
+                "    - name: Collect bounded Coverage failure evidence\n",
+                "    - id: upload_coverage_profile\n",
+                temp, dict(GITHUB_WORKSPACE=str(workspace)),
+                preamble="go() { exit 87; }\nsudo() { exit 88; }\n",
+            )
+            result = self.run_failure_step(temp)
+            bundle = temp / "coverage-failure"
+            self.assertEqual(reports.returncode, 0, reports.stderr)
+            self.assertEqual((bundle / stderr.name).stat().st_size, 65536)
+            self.assertTrue((bundle / stderr.name).read_text().endswith("last runner error\n"))
+            self.assertFalse((bundle / "ut-coverage-cgo.log").exists())
+            self.assertFalse((bundle / "ut-coverage-report.json").exists())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAILED example/pkg / TestFailed", result.stdout)

@@ -15,11 +15,18 @@ self-hosted-runner:
     - mac-arm64-mini
 
 paths:
-  .github/workflows/coverage-release-storage.yaml:
+  .github/workflows/coverage-worker-cs.yaml:
     ignore:
       - 'property "workflow_sha" is not defined'
-  .github/workflows/coverage-worker.yaml:
+  .github/workflows/coverage-worker-idc.yaml:
     ignore:
+      - 'property "workflow_sha" is not defined'
+  .github/workflows/coverage-ut-standby.yaml:
+    ignore:
+      - 'property "workflow_sha" is not defined'
+  .github/workflows/coverage-queue-handoff.yaml:
+    ignore:
+      # Same GitHub.com reusable-workflow identity used by coverage-ut.yaml.
       - 'property "workflow_sha" is not defined'
   .github/workflows/ci.yaml:
     ignore:
@@ -61,3 +68,13 @@ paths:
       - 'constant expression "false" in condition'
       # Legacy release workflow pinned from MatrixOne at CI@release/3.0-dev.
       - 'property "setup_mo_test_env" is not defined'
+
+  .github/workflows/coverage-ut-native.yaml:
+    ignore:
+      - 'property "workflow_sha" is not defined'
+  .github/workflows/coverage-worker.yaml:
+    ignore:
+      - 'property "workflow_sha" is not defined'
+  .github/workflows/coverage-release-storage.yaml:
+    ignore:
+      - 'property "workflow_sha" is not defined'
