@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import tempfile
 import textwrap
@@ -71,6 +72,9 @@ class CSS3CoverageTest(unittest.TestCase):
             (idc, "shared", {"TEST_UID": "0"}, None, None),
             (idc, "shared", {"TEST_DISK": "62914559"}, None, None),
             (idc, "shared", {"TEST_SUDO_STATUS": "0"}, None, None),
+            (idc, "shared", {"EXPOSED_FILE": "token"}, None, None),
+            (idc, "shared", {"EXPOSED_FILE": "docker.sock"}, None, None),
+            (idc, "shared", {"EXPOSED_FILE": "containerd.sock"}, None, None),
             ("unknown", "shared", {}, None, None),
         )
         script = """
@@ -79,14 +83,28 @@ id() { echo "${TEST_UID:-1001}"; }
 sudo() { return "${TEST_SUDO_STATUS:-1}"; }
 df() { printf 'dev 99999999 0 %s 0%% /\\n' "${TEST_DISK:-62914560}"; }
 """ + step_script("reader")
+        host_paths = ("/var/run/secrets/kubernetes.io/serviceaccount/token",
+                      "/var/run/docker.sock", "/run/containerd/containerd.sock")
+        for path in host_paths:
+            self.assertIn(path, script)
         for runner, requested, extra, pool, site in cases:
             with self.subTest(runner=runner, requested=requested, extra=extra), tempfile.TemporaryDirectory() as tmp:
-                output = Path(tmp) / "output"
+                root = Path(tmp)
+                output = root / "output"
+                isolated = script
+                for path in host_paths:
+                    fixture = root / Path(path).name
+                    isolated = isolated.replace(path, shlex.quote(str(fixture)))
+                    if fixture.name == extra.get("EXPOSED_FILE"):
+                        if fixture.suffix == ".sock":
+                            fixture.symlink_to(root / "missing")
+                        else:
+                            fixture.touch()
                 env = dict(PATH=os.environ["PATH"], ACTUAL_RUNNER=runner, REQUESTED_POOL=requested,
                            CS_CACHE_ENV="jed", CS_CACHE_NODE="mo-standard-0", CS_CACHE_EXPECTED_NODE="mo-standard-0",
-                           GITHUB_OUTPUT=str(output), GITHUB_WORKSPACE=tmp, GITHUB_STEP_SUMMARY=str(Path(tmp) / "summary"))
-                result = subprocess.run(["bash", "-c", script], env={**env, **extra}, capture_output=True)
-                self.assertEqual(result.returncode == 0, pool is not None, result.stderr)
+                           GITHUB_OUTPUT=str(output), GITHUB_WORKSPACE=tmp, GITHUB_STEP_SUMMARY=str(root / "summary"))
+                result = subprocess.run(["bash", "-c", isolated], env={**env, **extra}, capture_output=True)
+                self.assertEqual(result.returncode == 0, pool is not None, result.stdout + result.stderr)
                 self.assertEqual(output.read_text() if output.exists() else "",
                                  f"pool={pool}\nsite={site}\n" if pool else "")
 
