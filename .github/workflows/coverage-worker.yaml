@@ -26,21 +26,24 @@ jobs:
     steps:
     - id: reader
       name: Verify the assigned Coverage runner before checkout
-      env:
-        ACTUAL_RUNNER: ${{ runner.name }}
       run: |
         set -euo pipefail
-        if [[ "$ACTUAL_RUNNER" =~ ^cs-(mty|jed|ruh|mnl2)-nc-n([012])-pr-v1-[a-z0-9]+-runner-[a-z0-9]+$ ]]; then
-          site=${BASH_REMATCH[1]} node=${BASH_REMATCH[2]}
-          if ! [[ "$(uname -m)" == x86_64 && "$site:$node" != mty:2 && "$site" == "${CS_CACHE_ENV:-}" &&
-                  "mo-standard-$node" == "${CS_CACHE_NODE:-}" && "$CS_CACHE_NODE" == "${CS_CACHE_EXPECTED_NODE:-}" ]]; then
-            echo '::error::CS worker does not match the approved pool or node binding'
+        site=${MO_COVERAGE_RUNNER_SITE:-}
+        if [[ "$(uname -m)" != x86_64 ]]; then
+          echo '::error::Coverage workers require x86_64'
+          exit 1
+        fi
+        if [[ "$site" =~ ^(mty|jed|ruh|mnl2)$ ]]; then
+          node=${CS_CACHE_NODE:-}
+          if ! [[ "$site" == "${CS_CACHE_ENV:-}" && "$node" =~ ^mo-standard-[012]$ &&
+                  "$node" == "${CS_CACHE_EXPECTED_NODE:-}" && "$site:$node" != mty:mo-standard-2 ]]; then
+            echo '::error::CS worker does not match the approved node binding'
             exit 1
           fi
           pool=cs
-        elif [[ "$ACTUAL_RUNNER" == amd64-mo-shanghai-ut-safe-*-runner-* ]]; then
-          if ! [[ "$(uname -m)" == x86_64 && "$(id -u)" != 0 ]]; then
-            echo '::error::Shanghai worker does not match the approved pool or isolation'
+        elif [[ "$site" == shanghai ]]; then
+          if [[ "$(id -u)" == 0 || -n "${CS_CACHE_ENV:-}${CS_CACHE_NODE:-}${CS_CACHE_EXPECTED_NODE:-}" ]]; then
+            echo '::error::Shanghai worker does not match the approved isolation'
             exit 1
           fi
           for path in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/docker.sock /run/containerd/containerd.sock; do
@@ -54,9 +57,9 @@ jobs:
             exit 1
           fi
           test "$(df -Pk "$GITHUB_WORKSPACE" | awk 'END{print $4}')" -ge 62914560
-          pool=idc site=shanghai
+          pool=idc
         else
-          echo '::error::Unrecognized Coverage worker'
+          echo '::error::Coverage workers require an approved MO_COVERAGE_RUNNER_SITE'
           exit 1
         fi
         proxy=${MO_COVERAGE_GOPROXY:-}
@@ -151,27 +154,26 @@ jobs:
       timeout-minutes: 5
       run: |
         set -euo pipefail
-        required=$(awk '$1 == "go" { print $2; exit }' go.mod)
-        if ! [[ "$required" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          echo '::error::Coverage requires a pinned Go toolchain version in go.mod'
-          exit 1
+        module=$(env -u GOROOT GOTOOLCHAIN=local GOWORK=off go mod edit -json)
+        go_version=$(jq -r '.Go // ""' <<< "$module")
+        toolchain=auto
+        # Use a specified release as the default and let Go apply toolchain directives.
+        case "$go_version" in
+          *.*.*|*rc*|*beta*) toolchain="go${go_version}+auto" ;;
+        esac
+
+        # Go looks for versioned executables before consulting the module proxy.
+        tools=$(mktemp -d "$RUNNER_TEMP/coverage-go-bin.XXXXXXXX")
+        if [[ -n "${RUNNER_TOOL_CACHE:-}" ]]; then
+          for cached_go in "$RUNNER_TOOL_CACHE"/go/*/x64/bin/go; do
+            [[ -x "$cached_go" && -f "${cached_go%/bin/go}.complete" ]] || continue
+            version_dir=${cached_go%/x64/bin/go}
+            ln -s "$cached_go" "$tools/go${version_dir##*/}"
+          done
         fi
-        installed=$(env -u GOROOT go env GOVERSION 2>/dev/null || true)
-        cached="$RUNNER_TOOL_CACHE/go/$required/x64/bin/go"
-        if [[ "$installed" == "go$required" ]]; then
-          selected=$(env -u GOROOT go env GOROOT)
-        elif [[ -x "$cached" ]]; then
-          selected=$(env -u GOROOT "$cached" env GOROOT)
-        else
-          # Go verifies the toolchain module through the site proxy and sumdb.
-          # Keep it out of the reviewed compile-cache paths.
-          selected=$(env -u GOROOT GOTOOLCHAIN="go$required" \
-            GOMODCACHE="$RUNNER_TEMP/coverage-go-toolchain" go env GOROOT)
-        fi
-        if ! [[ -x "$selected/bin/go" && "$(env -u GOROOT "$selected/bin/go" env GOVERSION)" == "go$required" ]]; then
-          echo "::error::Expected Go $required on the Coverage worker"
-          exit 1
-        fi
+        selected=$(env -u GOROOT GOTOOLCHAIN="$toolchain" GOWORK=off PATH="$tools:$PATH" \
+          GOMODCACHE="$RUNNER_TEMP/coverage-go-toolchain" go env GOROOT)
+        test -x "$selected/bin/go"
         printf 'GOROOT=%s\n' "$selected" >> "$GITHUB_ENV"
         printf '%s/bin\n' "$selected" >> "$GITHUB_PATH"
     - name: Configure the site-local Python dependency mirror

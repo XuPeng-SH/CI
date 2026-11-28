@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -61,33 +62,35 @@ class CSS3CoverageTest(unittest.TestCase):
         self.assertIn("COVERAGE_PR_READ_TOKEN", group)
 
     def test_runner_assignment_checks_both_pools_before_checkout(self):
-        cs = "cs-jed-nc-n0-pr-v1-abc-runner-def"
-        idc = "amd64-mo-shanghai-ut-safe-abc-runner-def"
+        shared_runner = "matrixone-coverage-x86-abcde-runner-fghij"
         cases = (
-            (cs, {}, "cs", "jed"),
-            (cs.replace("jed", "mty"), {"CS_CACHE_ENV": "mty"}, "cs", "mty"),
-            (cs.replace("jed", "mnl2"), {"CS_CACHE_ENV": "mnl2"}, "cs", "mnl2"),
-            (cs.replace("jed", "ruh"), {"CS_CACHE_ENV": "ruh"}, "cs", "ruh"),
-            (idc, {}, "idc", "shanghai"),
-            (cs, {"CS_CACHE_ENV": "ruh"}, None, None),
-            (cs, {"CS_CACHE_EXPECTED_NODE": "mo-standard-1"}, None, None),
-            (cs.replace("jed-nc-n0", "mty-nc-n2"),
-             dict(CS_CACHE_ENV="mty", CS_CACHE_NODE="mo-standard-2", CS_CACHE_EXPECTED_NODE="mo-standard-2"), None, None),
-            (idc, {"TEST_UID": "0"}, None, None),
-            (idc, {"TEST_DISK": "62914559"}, None, None),
-            (idc, {"TEST_SUDO_STATUS": "0"}, None, None),
-            (idc, {"EXPOSED_FILE": "token"}, None, None),
-            (idc, {"EXPOSED_FILE": "docker.sock"}, None, None),
-            (idc, {"EXPOSED_FILE": "containerd.sock"}, None, None),
-            (idc, {"MO_COVERAGE_GOPROXY": ""}, None, None),
-            (idc, {"MO_COVERAGE_GOPROXY": "https://cache.internal|direct"}, None, None),
-            (cs, {"MO_COVERAGE_GOPROXY": "https://cache.internal,https://elsewhere"}, None, None),
-            (cs, {"MO_COVERAGE_GOPROXY": "https://cache.internal\nINJECTED=yes"}, None, None),
-            (cs, {"MISSING_FIXTURE": "yes"}, None, None),
-            ("unknown", {}, None, None),
+            ("jed", {}, "cs"),
+            ("mty", {}, "cs"),
+            ("mnl2", {}, "cs"),
+            ("ruh", {}, "cs"),
+            ("shanghai", {}, "idc"),
+            ("jed", {"CS_CACHE_ENV": "ruh"}, None),
+            ("jed", {"CS_CACHE_EXPECTED_NODE": "mo-standard-1"}, None),
+            ("jed", dict(CS_CACHE_NODE="mo-standard-3", CS_CACHE_EXPECTED_NODE="mo-standard-3"), None),
+            ("mty", dict(CS_CACHE_NODE="mo-standard-2", CS_CACHE_EXPECTED_NODE="mo-standard-2"), None),
+            ("jed", {"TEST_ARCH": "aarch64"}, None),
+            ("shanghai", {"TEST_UID": "0"}, None),
+            ("shanghai", {"CS_CACHE_ENV": "jed"}, None),
+            ("shanghai", {"TEST_DISK": "62914559"}, None),
+            ("shanghai", {"TEST_SUDO_STATUS": "0"}, None),
+            ("shanghai", {"EXPOSED_FILE": "token"}, None),
+            ("shanghai", {"EXPOSED_FILE": "docker.sock"}, None),
+            ("shanghai", {"EXPOSED_FILE": "containerd.sock"}, None),
+            ("shanghai", {"MO_COVERAGE_GOPROXY": ""}, None),
+            ("shanghai", {"MO_COVERAGE_GOPROXY": "https://cache.internal|direct"}, None),
+            ("jed", {"MO_COVERAGE_GOPROXY": "https://cache.internal,https://elsewhere"}, None),
+            ("jed", {"MO_COVERAGE_GOPROXY": "https://cache.internal\nINJECTED=yes"}, None),
+            ("jed", {"MISSING_FIXTURE": "yes"}, None),
+            ("", {"ACTUAL_RUNNER": "cs-jed-nc-n0-pr-v1-abc-runner-def"}, None),
+            ("unknown", {}, None),
         )
         script = """
-uname() { echo x86_64; }
+uname() { echo "${TEST_ARCH:-x86_64}"; }
 id() { echo "${TEST_UID:-1001}"; }
 sudo() { return "${TEST_SUDO_STATUS:-1}"; }
 df() { printf 'dev 99999999 0 %s 0%% /\\n' "${TEST_DISK:-62914560}"; }
@@ -96,8 +99,8 @@ df() { printf 'dev 99999999 0 %s 0%% /\\n' "${TEST_DISK:-62914560}"; }
                       "/var/run/docker.sock", "/run/containerd/containerd.sock")
         for path in host_paths:
             self.assertIn(path, script)
-        for runner, extra, pool, site in cases:
-            with self.subTest(runner=runner, extra=extra), tempfile.TemporaryDirectory() as tmp:
+        for site, extra, pool in cases:
+            with self.subTest(site=site, extra=extra), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 output = root / "output"
                 git_env = root / "env"
@@ -113,10 +116,11 @@ df() { printf 'dev 99999999 0 %s 0%% /\\n' "${TEST_DISK:-62914560}"; }
                             fixture.symlink_to(root / "missing")
                         else:
                             fixture.touch()
-                env = dict(PATH=os.environ["PATH"], ACTUAL_RUNNER=runner, GITHUB_ENV=str(git_env),
-                           MO_COVERAGE_GOPROXY="http://cache.internal:8080",
-                           CS_CACHE_ENV="jed", CS_CACHE_NODE="mo-standard-0", CS_CACHE_EXPECTED_NODE="mo-standard-0",
+                env = dict(PATH=os.environ["PATH"], ACTUAL_RUNNER=shared_runner, MO_COVERAGE_RUNNER_SITE=site,
+                           GITHUB_ENV=str(git_env), MO_COVERAGE_GOPROXY="http://cache.internal:8080",
                            GITHUB_OUTPUT=str(output), GITHUB_WORKSPACE=tmp, GITHUB_STEP_SUMMARY=str(root / "summary"))
+                if site in ("jed", "mty", "mnl2", "ruh"):
+                    env.update(CS_CACHE_ENV=site, CS_CACHE_NODE="mo-standard-0", CS_CACHE_EXPECTED_NODE="mo-standard-0")
                 result = subprocess.run(["bash", "-c", isolated], env={**env, **extra}, capture_output=True)
                 self.assertEqual(result.returncode == 0, pool is not None, result.stdout + result.stderr)
                 self.assertEqual(output.read_text() if output.exists() else "",
@@ -125,28 +129,58 @@ df() { printf 'dev 99999999 0 %s 0%% /\\n' "${TEST_DISK:-62914560}"; }
                 self.assertEqual(git_env.read_text() if git_env.exists() else "",
                                  "GOPROXY=http://cache.internal:8080\nGOTOOLCHAIN=local\n" if pool else "")
 
+    @unittest.skipUnless(shutil.which("go") and shutil.which("jq"), "requires Go and jq")
+    def test_go_accepts_language_version_and_preferred_toolchain(self):
+        script = step_script("go_toolchain")
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(PATH=os.environ["PATH"], GOTOOLCHAIN="local", GOPROXY="off", GOWORK="off")
+            installed, goroot = subprocess.check_output(["go", "env", "GOVERSION", "GOROOT"],
+                                                        env=env, cwd=tmp, text=True).splitlines()
+            language = installed.removeprefix("go").rsplit(".", 1)[0]
+        for directive in (f"go {language}", f"go {language}.0\ntoolchain {installed}"):
+            with self.subTest(directive=directive), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "go.mod").write_text(f"module example\n{directive}\n")
+                output = root / "github-env"
+                result = subprocess.run(["bash", "-c", script], cwd=root, capture_output=True, text=True,
+                                        env=dict(env, GITHUB_ENV=str(output), GITHUB_PATH=str(root / "path"),
+                                                 RUNNER_TEMP=tmp))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(output.read_text(), f"GOROOT={goroot}\n")
+
     def test_go_toolchain_prefers_local_copies_and_uses_the_site_proxy_on_a_miss(self):
         script = step_script("go_toolchain")
-        for cached, mirror_available in ((True, False), (False, True), (False, False)):
-            with self.subTest(cached=cached, mirror_available=mirror_available), tempfile.TemporaryDirectory() as tmp:
+        for ready, mirror_available in ((True, False), (False, True), (False, False)):
+            with self.subTest(ready=ready, mirror_available=mirror_available), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 (root / "go.mod").write_text("module example\ngo 1.27.1\n")
                 bootstrap = root / "bin"
                 bootstrap.mkdir()
                 toolcache = root / "installed"
-                selected = toolcache / "go/1.27.1/x64" if cached else root / "resolved"
-                (selected / "bin").mkdir(parents=True)
-                (selected / "bin/go").write_text('#!/bin/bash\n'
-                    f'if [[ "$2" == GOROOT ]]; then echo {shlex.quote(str(selected))}; else echo go1.27.1; fi\n')
-                (selected / "bin/go").chmod(0o755)
+                cached = toolcache / "go/1.27.1/x64"
+                downloaded = root / "resolved"
+                for tree in (cached, downloaded):
+                    (tree / "bin").mkdir(parents=True)
+                    go = tree / "bin/go"
+                    go.write_text(f'#!/bin/bash\necho {shlex.quote(str(tree))}\n')
+                    go.chmod(0o755)
+                if ready:
+                    cached.with_suffix(".complete").touch()
                 (bootstrap / "go").write_text(r"""#!/bin/bash
-if [[ "$GOTOOLCHAIN" == local ]]; then
-  echo go1.26.4
-elif [[ "$GOTOOLCHAIN" == go1.27.1 && "$GOPROXY" == http://cache.internal &&
+if [[ "$*" == 'mod edit -json' && "$GOTOOLCHAIN" == local ]]; then
+  echo '{"Go":"1.27.1"}'
+elif [[ "$*" == 'env GOROOT' && "$GOTOOLCHAIN" == go1.27.1+auto ]]; then
+  if command -v go1.27.1 >/dev/null; then
+    exec go1.27.1 "$@"
+  fi
+  if [[ "$GOPROXY" == http://cache.internal &&
         "$GOMODCACHE" == "$RUNNER_TEMP/coverage-go-toolchain" && "$MIRROR_AVAILABLE" == yes ]]; then
-  echo "$RUNNER_TEMP/resolved"
-else
+    echo "$RUNNER_TEMP/resolved"
+    exit 0
+  fi
   exit 42
+else
+  exit 43
 fi
 """)
                 (bootstrap / "go").chmod(0o755)
@@ -156,7 +190,8 @@ fi
                            RUNNER_TOOL_CACHE=str(toolcache), GOTOOLCHAIN="local", GOPROXY="http://cache.internal",
                            MIRROR_AVAILABLE="yes" if mirror_available else "no")
                 result = subprocess.run(["bash", "-c", script], cwd=root, env=env, capture_output=True, text=True)
-                valid = cached or mirror_available
+                valid = ready or mirror_available
+                selected = cached if ready else downloaded
                 self.assertEqual(result.returncode, 0 if valid else 42, result.stderr)
                 self.assertEqual(output.read_text() if output.exists() else "",
                                  f"GOROOT={selected}\n" if valid else "")
