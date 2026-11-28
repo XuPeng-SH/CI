@@ -1,4 +1,4 @@
-"""Production CS Coverage contracts; no network or real credentials."""
+"""Coverage runner, storage and release contracts using local fixtures."""
 
 import json
 import os
@@ -12,15 +12,13 @@ import unittest
 
 DIRECTORY = Path(__file__).parents[1] / ".github/workflows"
 ENTRY = (DIRECTORY / "coverage-ut.yaml").read_text()
-WORKFLOW = (DIRECTORY / "coverage-worker-cs.yaml").read_text()
-STANDBY = (DIRECTORY / "coverage-ut-standby.yaml").read_text()
+WORKFLOW = (DIRECTORY / "coverage-worker.yaml").read_text()
 STACKS = ("mty", "mnl2", "jed", "ruh")
-CONFIGS = tuple(f"CS_S3_{stack.upper()}_CONFIG" for stack in STACKS)
 
 
 def step_script(step, source=None):
     if source is None:
-        source = ENTRY if step == "check_coverage_secrets" else WORKFLOW
+        source = WORKFLOW
         if step == "eligibility":
             source = (DIRECTORY / "coverage-ut-pre-cutover.yaml").read_text()
     marker = re.search(rf"^( +)- id: {step}$", source, re.M)
@@ -29,26 +27,6 @@ def step_script(step, source=None):
 
 
 class CSS3CoverageTest(unittest.TestCase):
-    def gate(self, configs, *, member="1", label="0"):
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "output"
-            env = dict(PATH=os.environ["PATH"], GITHUB_OUTPUT=str(output), IN_ORG=member, SAFE_LABEL=label)
-            env.update({name: "opaque-test-value" for name in configs})
-            result = subprocess.run(["bash", "-c", step_script("check_coverage_secrets")],
-                                    env=env, capture_output=True, text=True)
-            self.assertNotIn("opaque-test-value", result.stdout + result.stderr)
-            return result.returncode, output.read_text()
-
-    def test_all_environments_required(self):
-        self.assertEqual(self.gate(CONFIGS), (0, "ready=true\n"))
-        for missing in CONFIGS:
-            with self.subTest(missing=missing):
-                code, output = self.gate([name for name in CONFIGS if name != missing])
-                self.assertNotEqual(code, 0)
-                self.assertEqual(output, "ready=false\n")
-        self.assertNotEqual(self.gate([], member="0", label="1")[0], 0)
-        self.assertEqual(self.gate([], member="0"), (0, "ready=false\n"))
-
     def test_normal_pr_trust_gate_preserved(self):
         for member, label, ready, allowed in (("0", "0", "true", False), ("1", "0", "true", True),
                                              ("0", "1", "true", True), ("1", "0", "false", False)):
@@ -60,66 +38,108 @@ class CSS3CoverageTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0)
                 self.assertEqual(output.read_text(), f"allowed={str(allowed).lower()}\n")
 
-    def test_shared_pool_and_pr_source_without_experiment_inputs(self):
-        self.assertIn("""'["cs-node-cache-7c14g"]'""", WORKFLOW)
-        self.assertIn("""'["cs-node-cache-7c14g","cs-{0}-node-cache-all"]'""", WORKFLOW)
-        self.assertIn("source: ${{ needs.check_coverage_eligibility.outputs.head_repository }}", ENTRY)
+    def test_native_jobs_run_in_the_parent_with_an_authorized_source(self):
+        group = ENTRY.split("\n  ut-coverage-linux-x86:\n")[1].split("\n  release-storage-coverage:\n")[0]
+        self.assertIn("group: [0, 1]", group)
+        self.assertIn("fail-fast: false", group)
+        self.assertIn("uses: ./.github/workflows/coverage-worker.yaml", group)
+        self.assertIn("source: ${{ needs.check_coverage_eligibility.outputs.head_repository }}", group)
+        self.assertIn("head: ${{ needs.check_coverage_eligibility.outputs.head_sha }}", group)
+        self.assertIn("COVERAGE_EXPECTED_SOURCE: ${{ inputs.source }}", WORKFLOW)
+        self.assertIn("COVERAGE_EXPECTED_HEAD: ${{ inputs.head }}", WORKFLOW)
         self.assertIn("repository: ${{ inputs.source }}", WORKFLOW)
-        self.assertIn("head: ${{ needs.check_coverage_eligibility.outputs.head_sha }}", ENTRY)
         self.assertIn("ref: ${{ inputs.head }}", WORKFLOW)
-        self.assertNotRegex(WORKFLOW, r"inputs\.(canary_\w+|runner_label)|weilu-runner-test|pulls/325\d+|minio-source")
-        consumer = WORKFLOW
-        self.assertNotRegex(consumer, r"secrets\.(TEST_S3FS_(ALIYUN|QCLOUD)|S3\w+)")
+        self.assertLess(WORKFLOW.index("- id: reader"), WORKFLOW.index("- id: verify_pr"))
+        self.assertLess(WORKFLOW.index("- id: verify_pr"), WORKFLOW.index("name: Checkout MatrixOne source"))
+        self.assertNotRegex(WORKFLOW + ENTRY, r"workflow_dispatch|actions: write|runs/(?=\$|\{)")
         self.assertIn("COVERAGE_UT_PACKAGE_PARALLELISM: '7'", WORKFLOW)
-        self.assertIn('COVERAGE_GROUP: ${{ inputs.group }}', WORKFLOW)
 
-    def test_runner_selects_only_its_own_storage(self):
-        for stack in (*STACKS, "unknown"):
+    def test_runner_assignment_checks_both_pools_before_checkout(self):
+        cs = "cs-jed-nc-n0-pr-v1-abc-runner-def"
+        idc = "amd64-mo-shanghai-ut-safe-abc-runner-def"
+        cases = (
+            (cs, "cs", {}, "cs", "jed"), (cs, "shared", {}, "cs", "jed"),
+            (cs.replace("jed", "mty"), "shared", {"CS_CACHE_ENV": "mty"}, "cs", "mty"),
+            (cs.replace("jed", "mnl2"), "shared", {"CS_CACHE_ENV": "mnl2"}, "cs", "mnl2"),
+            (cs.replace("jed", "ruh"), "shared", {"CS_CACHE_ENV": "ruh"}, "cs", "ruh"),
+            (idc, "idc", {}, "idc", "shanghai"), (idc, "shared", {}, "idc", "shanghai"),
+            (cs, "idc", {}, None, None), (idc, "cs", {}, None, None),
+            (cs, "shared", {"CS_CACHE_ENV": "ruh"}, None, None),
+            (cs, "shared", {"CS_CACHE_EXPECTED_NODE": "mo-standard-1"}, None, None),
+            (cs.replace("jed-nc-n0", "mty-nc-n2"), "shared",
+             dict(CS_CACHE_ENV="mty", CS_CACHE_NODE="mo-standard-2", CS_CACHE_EXPECTED_NODE="mo-standard-2"), None, None),
+            (idc, "shared", {"TEST_UID": "0"}, None, None),
+            (idc, "shared", {"TEST_DISK": "62914559"}, None, None),
+            (idc, "shared", {"TEST_SUDO_STATUS": "0"}, None, None),
+            ("unknown", "shared", {}, None, None),
+        )
+        script = """
+uname() { echo x86_64; }
+id() { echo "${TEST_UID:-1001}"; }
+sudo() { return "${TEST_SUDO_STATUS:-1}"; }
+df() { printf 'dev 99999999 0 %s 0%% /\\n' "${TEST_DISK:-62914560}"; }
+""" + step_script("reader")
+        for runner, requested, extra, pool, site in cases:
+            with self.subTest(runner=runner, requested=requested, extra=extra), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "output"
+                env = dict(PATH=os.environ["PATH"], ACTUAL_RUNNER=runner, REQUESTED_POOL=requested,
+                           CS_CACHE_ENV="jed", CS_CACHE_NODE="mo-standard-0", CS_CACHE_EXPECTED_NODE="mo-standard-0",
+                           GITHUB_OUTPUT=str(output), GITHUB_WORKSPACE=tmp, GITHUB_STEP_SUMMARY=str(Path(tmp) / "summary"))
+                result = subprocess.run(["bash", "-c", script], env={**env, **extra}, capture_output=True)
+                self.assertEqual(result.returncode == 0, pool is not None, result.stderr)
+                self.assertEqual(output.read_text() if output.exists() else "",
+                                 f"pool={pool}\nsite={site}\n" if pool else "")
+
+    def test_cs_credentials_are_selected_only_for_the_assigned_site(self):
+        value = re.search(r"TEST_S3FS_CS: >-\n\s*\$\{\{(.*?)\}\}", WORKFLOW, re.S)[1]
+        for site in (*STACKS, "shanghai"):
             for missing in (False, True):
-                for field in ("CS_S3_ENV", "TEST_S3FS_CS"):
-                    with self.subTest(stack=stack, missing=missing, field=field):
-                        expression = re.search(rf"{field}: \$\{{\{{(.*?)\}}\}}", WORKFLOW, re.S)[1]
-                        expression = " ".join(expression.split())
-                        expression = re.sub(r"startsWith\(runner.name, '([^']+)'\)",
-                                            lambda m: str(f"cs-{stack}-large-7c14g-runner".startswith(m[1])), expression)
-                        for env in STACKS:
-                            value = "" if missing and env == stack else env
-                            expression = expression.replace(f"secrets.CS_S3_{env.upper()}_CONFIG", repr(value))
-                        expression = expression.replace("&&", " and ").replace("||", " or ")
-                        expected = "" if stack == "unknown" or (missing and field == "TEST_S3FS_CS") else stack
-                        self.assertEqual(eval(expression, {"__builtins__": {}}), expected)
+                with self.subTest(site=site, missing=missing):
+                    expr = " ".join(value.split()).replace("steps.reader.outputs.site", repr(site))
+                    for stack in STACKS:
+                        expr = expr.replace(f"secrets.CS_S3_{stack.upper()}_CONFIG", repr("" if missing and stack == site else stack))
+                    self.assertEqual(eval(expr.replace("&&", " and ").replace("||", " or "), {"__builtins__": {}}),
+                                     site if site in STACKS and not missing else "")
+        for field in ("IDC_ENDPOINT", "IDC_REGION", "IDC_BUCKET", "IDC_KEY", "IDC_SECRET"):
+            self.assertRegex(WORKFLOW, rf"{field}: \$\{{\{{ steps.reader.outputs.pool == 'idc' && secrets\.")
 
-    def test_runtime_rejects_missing_config_and_isolates_attempts(self):
+    def test_storage_fixture_rejects_missing_credentials_before_ut_and_uses_attempt_prefix(self):
         script = step_script("coverage_ut").split('coverage_profile="', 1)[0]
-        for stack, config, ok in [(s, "opaque-test-value", True) for s in STACKS] + [("unknown", "value", False), ("jed", "", False)]:
-            for attempt in ("1", "2"):
-                with self.subTest(stack=stack, config=bool(config), attempt=attempt), tempfile.TemporaryDirectory() as directory:
-                    summary = Path(directory) / "summary"
-                    env = dict(PATH=os.environ["PATH"], RUNNER_TEMP=directory,
-                               GITHUB_WORKSPACE=directory, GITHUB_STEP_SUMMARY=str(summary),
-                               GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT=attempt, CS_CACHE_ENV=stack, CS_S3_ENV=stack, TEST_S3FS_CS=config,
-                               COVERAGE_GROUP="0", GOMAXPROCS="7", COVERAGE_UT_PACKAGE_PARALLELISM="7",
-                               endpoint="legacy", TEST_S3FS_ALIYUN="legacy", TEST_S3FS_QCLOUD="legacy")
-                    result = subprocess.run(["bash", "-c", script + '\ntest -z "${endpoint+x}${TEST_S3FS_ALIYUN+x}${TEST_S3FS_QCLOUD+x}"'],
-                                            env=env, capture_output=True, text=True)
-                    self.assertEqual(result.returncode == 0, ok)
-                    if ok:
-                        self.assertIn(f"ci-ut/123-{attempt}", summary.read_text())
-                        self.assertNotIn(config, summary.read_text() + result.stdout + result.stderr)
+        for pool, site, missing, attempt in (("cs", "jed", False, "1"), ("cs", "jed", True, "2"),
+                                              ("idc", "shanghai", False, "2"), ("idc", "shanghai", True, "1")):
+            with self.subTest(pool=pool, missing=missing, attempt=attempt), tempfile.TemporaryDirectory() as tmp:
+                summary = Path(tmp) / "summary"
+                env = dict(PATH=os.environ["PATH"], RUNNER_TEMP=tmp, GITHUB_WORKSPACE=tmp, GITHUB_STEP_SUMMARY=str(summary),
+                           GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT=attempt, CS_CACHE_ENV=site, RUNNER_POOL=pool,
+                           RUNNER_SITE=site, TEST_S3FS_CS="opaque-test-value" if pool == "cs" and not missing else "",
+                           IDC_ENDPOINT="https://fixture.invalid", IDC_REGION="region", IDC_BUCKET="bucket",
+                           IDC_KEY="fixture-key", IDC_SECRET="" if missing else "opaque-test-value", COVERAGE_GROUP="0",
+                           endpoint="legacy", TEST_S3FS_ALIYUN="legacy", TEST_S3FS_QCLOUD="legacy")
+                result = subprocess.run(["bash", "-c", script + '\ntest -z "${endpoint+x}${TEST_S3FS_ALIYUN+x}${TEST_S3FS_QCLOUD+x}"'],
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, not missing, result.stderr)
+                self.assertNotIn("opaque-test-value", result.stdout + result.stderr)
+                if not missing:
+                    details = summary.read_text()
+                    self.assertIn(f"ci-ut/123-{attempt}/group-0", details)
+                    self.assertNotIn("opaque-test-value", details)
 
     def test_release_storage_uses_shanghai_and_the_authorized_head(self):
-        job = STANDBY.split("\n  release-storage-coverage:\n")[1].split("\n  merge-coverage-groups:\n")[0]
+        job = ENTRY.split("\n  release-storage-coverage:\n")[1].split("\n  merge-coverage-groups:\n")[0]
         self.assertIn("runs-on: amd64-mo-shanghai-ut-safe", job)
         self.assertIn("github.base_ref == '4.2-dev' && inputs.enable_4_2_dev", job)
         self.assertIn("needs.check_coverage_eligibility.outputs.allowed == 'true'", job)
         self.assertIn("ref: ${{ needs.check_coverage_eligibility.outputs.head_sha }}", job)
         self.assertLess(job.index("Verify Shanghai runner isolation"), job.index("Checkout authorized MatrixOne head"))
-        self.assertLess(job.index("coverage_pr_entry.py\n        grep"), job.index("Checkout authorized MatrixOne head"))
+        self.assertLess(job.index("Reauthorize the exact release PR"), job.index("Checkout authorized MatrixOne head"))
+        retry = job.split("name: Reauthorize the exact release PR")[1].split("Checkout authorized MatrixOne head")[0]
+        self.assertIn('run: PYTHONPATH="$GITHUB_WORKSPACE/reviewed/scripts" python3 coverage-tools/scripts/coverage_pr_entry.py', retry)
+        self.assertNotIn("$GITHUB_OUTPUT", retry)
         self.assertIn("profile: ${{ steps.profile.outputs.artifact-id }}", job)
-        self.assertIn("artifact-ids: ${{ needs.release-storage-coverage.outputs.profile }}", STANDBY)
+        self.assertIn("artifact-ids: ${{ needs.release-storage-coverage.outputs.profile }}", ENTRY)
 
     def test_release_provider_coverage_requires_actual_provider_passes(self):
-        script = step_script("test_storage_providers", STANDBY)
+        script = step_script("test_storage_providers", ENTRY)
         package = "github.com/matrixorigin/matrixone/pkg/fileservice"
         passed = [dict(Action="pass", Package=package, Test=name) for name in (
             "TestObjectStorages/oss_eu/storage/aliyun/basic",
@@ -169,7 +189,7 @@ class CSS3CoverageTest(unittest.TestCase):
                     self.assertFalse((root / "args").exists())
 
     def test_release_merge_requires_and_includes_provider_coverage(self):
-        require = step_script("validate_release_storage", STANDBY)
+        require = step_script("validate_release_storage", ENTRY)
         for status, profile, expected in (
                 ("success", "123", True), ("success", "", False),
                 ("skipped", "123", False), ("failure", "123", False)):
@@ -178,12 +198,12 @@ class CSS3CoverageTest(unittest.TestCase):
                                         env=dict(PATH=os.environ["PATH"], STORAGE_RESULT=status, STORAGE_PROFILE=profile))
                 self.assertEqual(result.returncode == 0, expected)
 
-        download = STANDBY.split("    - name: Download the selected release provider profile\n", 1)[1]
+        download = ENTRY.split("    - name: Download the selected release provider profile\n", 1)[1]
         download = download.split("    - id: merge_profiles\n", 1)[0]
         # The pinned action nests downloads by artifact ID unless flattening is enabled.
         self.assertRegex(download, r"(?m)^        merge-multiple: true$")
         storage_dir = re.search(r"(?m)^        path: (.+)$", download)[1]
-        merge = step_script("merge_profiles", STANDBY)
+        merge = step_script("merge_profiles", ENTRY)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scripts = root / "scripts"
@@ -222,9 +242,11 @@ class CSS3CoverageTest(unittest.TestCase):
         for action in ("pass", "skip", "fail", "missing"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
                 report = Path(directory) / "report.json"
-                report.write_text("\n".join(json.dumps(dict(Action=action if i else "pass", Test=name,
-                                                          Package="github.com/matrixorigin/matrixone/pkg/fileservice"))
-                                           for i, name in enumerate(names) if not (i and action == "missing")))
+                events = [dict(Action=action if i else "pass", Test=name,
+                               Package="github.com/matrixorigin/matrixone/pkg/fileservice")
+                          for i, name in enumerate(names) if not (i and action == "missing")]
+                events.append(dict(Action="pass", Package="another/package"))
+                report.write_text("\n".join(map(json.dumps, events)))
                 result = subprocess.run(["bash", "-c", script], capture_output=True,
                                         env=dict(PATH=os.environ["PATH"], coverage_report=str(report), COVERAGE_GROUP="0"))
                 self.assertEqual(result.returncode == 0, action == "pass")

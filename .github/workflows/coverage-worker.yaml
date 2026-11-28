@@ -1,11 +1,12 @@
-name: Coverage worker cs
+name: Coverage worker
 on:
   workflow_call:
     inputs:
       group: {type: number, required: true}
       source: {type: string, required: true}
       head: {type: string, required: true}
-      ticket: {type: string, default: ''}
+      runner_pool: {type: string, required: true}
+      enable_4_2_dev: {type: boolean, default: false}
     secrets:
       TOKEN_ACTION: {required: false}
       CS_COVERAGE_CACHE_READ_TOKEN: {required: false}
@@ -13,64 +14,109 @@ on:
       CS_S3_MNL2_CONFIG: {required: false}
       CS_S3_JED_CONFIG: {required: false}
       CS_S3_RUH_CONFIG: {required: false}
-# Direct caller supplies contents:read; the dispatch wrapper supplies actions:read
-# as well for lookup of the parent grant. Neither caller grants write access.
+      S3ENDPOINT: {required: false}
+      S3REGION: {required: false}
+      S3BUCKET: {required: false}
+      S3APIKEY: {required: false}
+      S3APISECRET: {required: false}
+permissions:
+  contents: read
+  pull-requests: read
 jobs:
   worker:
-    name: Coverage reservation CS group ${{ inputs.group }}
+    name: Run Coverage group ${{ inputs.group }}
     if: >-
-      github.repository == 'matrixorigin/matrixone' && (inputs.group == 0 || inputs.group == 1) &&
-      ((github.event_name == 'workflow_dispatch' && github.workflow_ref == 'matrixorigin/matrixone/.github/workflows/coverage-standby-worker.yaml@refs/heads/main' && inputs.ticket != '') || (github.event_name == 'pull_request_target' && github.workflow_ref == 'matrixorigin/matrixone/.github/workflows/entrypoint.yaml@refs/heads/main' && inputs.ticket == '')) &&
-      (!fromJSON(inputs.ticket || '{}').site || contains(fromJSON('["mty","jed","mnl2","ruh"]'), fromJSON(inputs.ticket || '{}').site))
+      github.repository == 'matrixorigin/matrixone' && github.event_name == 'pull_request_target' &&
+      (inputs.group == 0 || inputs.group == 1) &&
+      (github.workflow_ref == 'matrixorigin/matrixone/.github/workflows/entrypoint.yaml@refs/heads/main' ||
+      (inputs.enable_4_2_dev && github.base_ref == '4.2-dev' &&
+      github.workflow_ref == 'matrixorigin/matrixone/.github/workflows/entrypoint.yaml@refs/heads/4.2-dev'))
     runs-on: >-
-      ${{ fromJSON(fromJSON(inputs.ticket || '{}').site &&
-      format('["cs-node-cache-7c14g","cs-{0}-node-cache-all"]', fromJSON(inputs.ticket || '{}').site) ||
-      '["cs-node-cache-7c14g"]') }}
+      ${{ inputs.runner_pool == 'shared' && 'matrixone-coverage-x86' ||
+      inputs.runner_pool == 'idc' && 'amd64-mo-shanghai-ut-safe' || 'cs-node-cache-7c14g' }}
     environment: ci
     timeout-minutes: 320
     steps:
-    - name: Load trusted admission and failure reporting helpers
+    - id: reader
+      name: Verify the assigned Coverage runner before checkout
+      env:
+        ACTUAL_RUNNER: ${{ runner.name }}
+        REQUESTED_POOL: ${{ inputs.runner_pool }}
+      run: |
+        set -euo pipefail
+        if [[ "$ACTUAL_RUNNER" =~ ^cs-(mty|jed|ruh|mnl2)-nc-n([012])-pr-v1-[a-z0-9]+-runner-[a-z0-9]+$ ]]; then
+          site=${BASH_REMATCH[1]} node=${BASH_REMATCH[2]}
+          if ! [[ ( "$REQUESTED_POOL" == cs || "$REQUESTED_POOL" == shared ) &&
+                  "$(uname -m)" == x86_64 && "$site:$node" != mty:2 && "$site" == "${CS_CACHE_ENV:-}" &&
+                  "mo-standard-$node" == "${CS_CACHE_NODE:-}" && "$CS_CACHE_NODE" == "${CS_CACHE_EXPECTED_NODE:-}" ]]; then
+            echo '::error::CS worker does not match the approved pool or node binding'
+            exit 1
+          fi
+          pool=cs
+        elif [[ "$ACTUAL_RUNNER" == amd64-mo-shanghai-ut-safe-*-runner-* ]]; then
+          if ! [[ ( "$REQUESTED_POOL" == idc || "$REQUESTED_POOL" == shared ) &&
+                  "$(uname -m)" == x86_64 && "$(id -u)" != 0 ]]; then
+            echo '::error::Shanghai worker does not match the approved pool or isolation'
+            exit 1
+          fi
+          for path in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/docker.sock /run/containerd/containerd.sock; do
+            if [[ -e "$path" || -L "$path" ]]; then
+              echo "::error::Shanghai worker exposes $path"
+              exit 1
+            fi
+          done
+          if command -v sudo >/dev/null && sudo -n -l >/dev/null 2>&1; then
+            echo '::error::Shanghai worker allows noninteractive sudo'
+            exit 1
+          fi
+          test "$(df -Pk "$GITHUB_WORKSPACE" | awk 'END{print $4}')" -ge 62914560
+          pool=idc site=shanghai
+        else
+          echo '::error::Unrecognized Coverage worker'
+          exit 1
+        fi
+        printf 'pool=%s\nsite=%s\n' "$pool" "$site" >> "$GITHUB_OUTPUT"
+        echo "- Coverage runner: $pool / $site" >> "$GITHUB_STEP_SUMMARY"
+    - name: Load trusted Coverage entry and build helpers
       uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
       with:
         repository: matrixorigin/CI
         ref: ${{ job.workflow_sha }}
-        path: .standby
+        path: .coverage-control
         sparse-checkout: |
-          scripts/coverage_standby.py
+          scripts/coverage_pr_entry.py
           scripts/summarize_ut_report.py
           scripts/coverage_cs_build_tools.sh
         sparse-checkout-cone-mode: false
         persist-credentials: false
-    - name: Wait for an exclusive grant for this exact run before PR checkout
-      id: admission
-      if: inputs.ticket != ''
-      timeout-minutes: 20
+    - name: Load reviewed authorization helpers
+      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      with:
+        repository: matrixorigin/CI
+        ref: 7a8cf1854da5ca4cc5ffb5a1f2cbc454162ad589
+        persist-credentials: false
+        path: .coverage-auth
+        sparse-checkout: |
+          scripts/node_cache_real_pr_gate.py
+          scripts/incremental_cache.py
+        sparse-checkout-cone-mode: false
+    - id: verify_pr
+      name: Recheck the assigned PR snapshot before checkout
+      timeout-minutes: 3
       env:
-        ACTIONS_TOKEN: ${{ github.token }}
-        TICKET: ${{ inputs.ticket }}
-        SOURCE: ${{ inputs.source }}
-        HEAD: ${{ inputs.head }}
-        GROUP: ${{ inputs.group }}
-        POOL: cs
-      run: python3 -I .standby/scripts/coverage_standby.py admit
+        CS_PR_METADATA_TOKEN: ${{ github.run_attempt > 1 && secrets.TOKEN_ACTION || github.token }}
+        CS_CACHE_READ_TOKEN: ${{ github.run_attempt > 1 && secrets.CS_COVERAGE_CACHE_READ_TOKEN || github.token }}
+        COVERAGE_EXPECTED_SOURCE: ${{ inputs.source }}
+        COVERAGE_EXPECTED_HEAD: ${{ inputs.head }}
+        COVERAGE_ENABLE_4_2_DEV: ${{ inputs.enable_4_2_dev }}
+      run: PYTHONPATH="$GITHUB_WORKSPACE/.coverage-auth/scripts" python3 .coverage-control/scripts/coverage_pr_entry.py
     - name: Preserve the trusted failure summary helper
-      run: install -m 0444 .standby/scripts/summarize_ut_report.py "$RUNNER_TEMP/coverage-summarize-ut-report.py"
-    - id: reader
-      name: Verify assigned reader before checkout
-      shell: bash
-      env:
-        ACTUAL_RUNNER: ${{ runner.name }}
-      run: |
-        set -euo pipefail
-        [[ "$ACTUAL_RUNNER" =~ ^cs-(mty|jed|ruh|mnl2)-nc-n([012])-pr-v1-[a-z0-9]+-runner-[a-z0-9]+$ ]]
-        site=${BASH_REMATCH[1]} node=${BASH_REMATCH[2]}
-        [[ "$site:$node" != mty:2 && "$site" == "${CS_CACHE_ENV:-}" ]]
-        [[ "mo-standard-$node" == "${CS_CACHE_NODE:-}" && "$CS_CACHE_NODE" == "${CS_CACHE_EXPECTED_NODE:-}" ]]
-        echo "site=$site" >> "$GITHUB_OUTPUT"
+      run: install -m 0444 .coverage-control/scripts/summarize_ut_report.py "$RUNNER_TEMP/coverage-summarize-ut-report.py"
     - name: Install CS runner build dependencies
       id: build_tools
+      if: steps.reader.outputs.pool == 'cs'
       timeout-minutes: 10
-      run: bash .standby/scripts/coverage_cs_build_tools.sh
+      run: bash .coverage-control/scripts/coverage_cs_build_tools.sh
     - name: Checkout MatrixOne source
       timeout-minutes: 10
       uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
@@ -78,49 +124,75 @@ jobs:
         GIT_HTTP_LOW_SPEED_LIMIT: '1'
         GIT_HTTP_LOW_SPEED_TIME: '60'
       with:
-        token: ${{ secrets.TOKEN_ACTION }}
+        token: ${{ steps.reader.outputs.pool == 'cs' && secrets.TOKEN_ACTION || github.token }}
         fetch-depth: '3'
         repository: ${{ inputs.source }}
         ref: ${{ inputs.head }}
         persist-credentials: false
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
-      with:
-        repository: matrixorigin/CI
-        ref: 7a8cf1854da5ca4cc5ffb5a1f2cbc454162ad589
-        persist-credentials: false
-        path: .ci-toolchain
-        sparse-checkout: |-
-          scripts
-          config
-        sparse-checkout-cone-mode: true
-    - name: Restore verified persistent tools from read-only node PVC (no network)
-      id: persistent_toolchain
-      timeout-minutes: 5
-      run: |
-        set -euo pipefail
-        python3 .ci-toolchain/scripts/node_cache_toolchain_store.py --catalog .ci-toolchain/config/node-compile-cache-catalog.json --lock .ci-toolchain/config/node-toolchain-lock.json --destination "$RUNNER_TEMP/node-toolchain-install" --report "$RUNNER_TEMP/persistent-toolchain.json"
-    - name: Prepare Python UDF contract tests
-      if: ${{ hashFiles('pkg/udf/python/worker/requirements.txt') != '' }}
-      timeout-minutes: 5
-      uses: matrixorigin/CI/actions/setup-python-udf@4670989748419fb169f88282cf05fb690ea91074
-    - name: Checkout CI coverage helper
-      id: coverage_helpers
+    - id: coverage_helpers
+      name: Checkout reviewed Coverage helpers
       timeout-minutes: 10
       uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
       env:
         GIT_HTTP_LOW_SPEED_LIMIT: '1'
         GIT_HTTP_LOW_SPEED_TIME: '60'
       with:
-        token: ${{ secrets.TOKEN_ACTION }}
         repository: matrixorigin/CI
         ref: 7a8cf1854da5ca4cc5ffb5a1f2cbc454162ad589
         persist-credentials: false
-        sparse-checkout: |
+        path: .ci-workflow
+        sparse-checkout: |-
           scripts
           config
         sparse-checkout-cone-mode: true
-        path: .ci-workflow
-    - name: Prepare fresh per-job compilation paths
+    - name: Restore verified persistent tools from read-only node PVC (no network)
+      id: persistent_toolchain
+      if: steps.reader.outputs.pool == 'cs'
+      timeout-minutes: 5
+      run: |
+        set -euo pipefail
+        python3 .ci-workflow/scripts/node_cache_toolchain_store.py --catalog .ci-workflow/config/node-compile-cache-catalog.json --lock .ci-workflow/config/node-toolchain-lock.json --destination "$RUNNER_TEMP/node-toolchain-install" --report "$RUNNER_TEMP/persistent-toolchain.json"
+    - name: Check the restored Go version against go.mod
+      id: go_toolchain
+      if: steps.reader.outputs.pool == 'cs'
+      run: |
+        set -euo pipefail
+        required=$(awk '$1 == "go" { print $2; exit }' go.mod)
+        test -n "$required"
+        installed=$(GOTOOLCHAIN=local go env GOVERSION)
+        if [[ "$installed" == "go$required" ]]; then
+          echo 'matches=true' >> "$GITHUB_OUTPUT"
+        fi
+    - name: Set up the Go version declared by the source
+      if: steps.reader.outputs.pool == 'cs' && steps.go_toolchain.outputs.matches != 'true'
+      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      timeout-minutes: 5
+      env:
+        GOROOT: ''
+        GOTOOLCHAIN: local
+      with:
+        go-version-file: go.mod
+        cache: false
+    - name: Export the selected Go root for the build and cache
+      if: steps.reader.outputs.pool == 'cs' && steps.go_toolchain.outputs.matches != 'true'
+      run: |
+        set -euo pipefail
+        # setup-go adds its bin to PATH. Infer its root without the PVC Go's GOROOT.
+        selected=$(env -u GOROOT GOTOOLCHAIN=local go env GOROOT)
+        printf 'GOROOT=%s\n' "$selected" >> "$GITHUB_ENV"
+    - name: Prepare cold build toolchain on Shanghai
+      if: steps.reader.outputs.pool == 'idc'
+      timeout-minutes: 10
+      uses: matrixorigin/CI/actions/setup-env@5fc75d89bc2841e50ae1557d28ebd9aaec6ec3e2
+      with:
+        setup-java: false
+        go-version-file: go.mod
+    - name: Prepare Python UDF contract tests
+      if: ${{ hashFiles('pkg/udf/python/worker/requirements.txt') != '' }}
+      timeout-minutes: 5
+      uses: matrixorigin/CI/actions/setup-python-udf@4670989748419fb169f88282cf05fb690ea91074
+    - name: Prepare fresh per-job CS compilation paths
+      if: steps.reader.outputs.pool == 'cs'
       env:
         GROUP: ${{ inputs.group }}
       run: |
@@ -136,6 +208,7 @@ jobs:
         echo 'CGO_ENABLED=1' >> "$GITHUB_ENV"
         echo 'GOMAXPROCS=7' >> "$GITHUB_ENV"
     - id: node_cache
+      if: steps.reader.outputs.pool == 'cs'
       name: Configure reviewed node cache with private incremental writes
       timeout-minutes: 5
       env:
@@ -157,14 +230,22 @@ jobs:
       timeout-minutes: 190
       continue-on-error: true
       env:
-        GOPROXY: https://goproxy.cn|https://proxy.golang.org|direct
-        CS_COMPILE_CACHE_HIT: 'false'
+        RUNNER_POOL: ${{ steps.reader.outputs.pool }}
+        RUNNER_SITE: ${{ steps.reader.outputs.site }}
+        GOPROXY: >-
+          ${{ steps.reader.outputs.pool == 'cs' && 'https://goproxy.cn|https://proxy.golang.org|direct' ||
+          'http://goproxy.goproxy.svc.cluster.local|https://goproxy.cn|direct' }}
         GOMAXPROCS: '7'
-        CS_S3_ENV: ${{ startsWith(runner.name, 'cs-mty-') && 'mty' || startsWith(runner.name, 'cs-mnl2-') && 'mnl2' || startsWith(runner.name,
-          'cs-jed-') && 'jed' || startsWith(runner.name, 'cs-ruh-') && 'ruh' || '' }}
-        TEST_S3FS_CS: ${{ startsWith(runner.name, 'cs-mty-') && secrets.CS_S3_MTY_CONFIG || startsWith(runner.name, 'cs-mnl2-')
-          && secrets.CS_S3_MNL2_CONFIG || startsWith(runner.name, 'cs-jed-') && secrets.CS_S3_JED_CONFIG || startsWith(runner.name,
-          'cs-ruh-') && secrets.CS_S3_RUH_CONFIG || '' }}
+        TEST_S3FS_CS: >-
+          ${{ steps.reader.outputs.site == 'mty' && secrets.CS_S3_MTY_CONFIG ||
+          steps.reader.outputs.site == 'mnl2' && secrets.CS_S3_MNL2_CONFIG ||
+          steps.reader.outputs.site == 'jed' && secrets.CS_S3_JED_CONFIG ||
+          steps.reader.outputs.site == 'ruh' && secrets.CS_S3_RUH_CONFIG || '' }}
+        IDC_ENDPOINT: ${{ steps.reader.outputs.pool == 'idc' && secrets.S3ENDPOINT || '' }}
+        IDC_REGION: ${{ steps.reader.outputs.pool == 'idc' && secrets.S3REGION || '' }}
+        IDC_BUCKET: ${{ steps.reader.outputs.pool == 'idc' && secrets.S3BUCKET || '' }}
+        IDC_KEY: ${{ steps.reader.outputs.pool == 'idc' && secrets.S3APIKEY || '' }}
+        IDC_SECRET: ${{ steps.reader.outputs.pool == 'idc' && secrets.S3APISECRET || '' }}
         COVERAGE_UT_TEST_TIMEOUT_SECONDS: '3600'
         COVERAGE_UT_HEARTBEAT_SECONDS: '15'
         COVERAGE_UT_CONSOLE_HEARTBEAT_SECONDS: '60'
@@ -190,17 +271,34 @@ jobs:
         }
         trap 'record_unreported_phase_failure "$?"' EXIT
         cd "$GITHUB_WORKSPACE"
-        test "${CS_CACHE_ENV:-}" = "$CS_S3_ENV"
-        echo "Coverage comparison: GOMAXPROCS=${GOMAXPROCS}; package parallelism=${COVERAGE_UT_PACKAGE_PARALLELISM}"
-        case "${CS_S3_ENV:-}" in
-          mty|mnl2|jed|ruh) ;;
-          *) echo '::error::Unknown CS runner environment; refusing to choose another environment storage.'; exit 1 ;;
-        esac
-        test -n "${TEST_S3FS_CS:-}" || { echo '::error::Missing S3 configuration for the selected CS runner.'; exit 1; }
+        if [[ "$RUNNER_POOL" == cs ]]; then
+          test "${CS_CACHE_ENV:-}" = "$RUNNER_SITE"
+          test -n "${TEST_S3FS_CS:-}" || { echo '::error::Missing S3 configuration for the selected CS runner.'; exit 1; }
+        else
+          [[ "$RUNNER_POOL" == idc && "$RUNNER_SITE" == shanghai ]] || exit 1
+          unset CS_NODE_CACHE_STATE GOCACHEPROG
+          # Same approved test-store fields as the existing Shanghai x86 UT.
+          # Use only the prefix-scoped fixture. Never log the serialized spec.
+          TEST_S3FS_CS="$(python3 - <<'PY'
+        import os
+        fields = {
+            "endpoint": os.environ["IDC_ENDPOINT"],
+            "region": os.environ["IDC_REGION"],
+            "bucket": os.environ["IDC_BUCKET"],
+            "key-id": os.environ["IDC_KEY"],
+            "key-secret": os.environ["IDC_SECRET"],
+        }
+        if any(not value or any(c in value for c in ",\r\n") for value in fields.values()):
+            raise SystemExit("Missing or unsupported Shanghai UT test-store field")
+        print("name=cs,is-minio=true," + ",".join(f"{key}={value}" for key, value in fields.items()))
+        PY
+          )"
+          export TEST_S3FS_CS
+          unset IDC_ENDPOINT IDC_REGION IDC_BUCKET IDC_KEY IDC_SECRET
+        fi
         export MO_CI_S3_PREFIX="ci-ut/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/group-${COVERAGE_GROUP}"
         unset endpoint region apikey apisecret bucket TEST_S3FS_ALIYUN TEST_S3FS_QCLOUD
-        echo "- Coverage runner environment: ${CS_S3_ENV}; storage: same-environment CS S3; prefix: ${MO_CI_S3_PREFIX}." >> "$GITHUB_STEP_SUMMARY"
-        echo '::notice::CS S3 mode: COS and OSS provider integration tests are not executed.'
+        echo "- Coverage storage: ${RUNNER_SITE}; prefix: ${MO_CI_S3_PREFIX}." >> "$GITHUB_STEP_SUMMARY"
         coverage_profile="${RUNNER_TEMP}/ut-coverage.out"
         coverage_report="${RUNNER_TEMP}/ut-coverage-report.json"
         coverage_progress="${RUNNER_TEMP}/ut-coverage-progress.txt"
@@ -320,12 +418,6 @@ jobs:
         test_scope=$(cat "$RUNNER_TEMP/coverage-group.txt")
         selected_count=$(wc -l < "$RUNNER_TEMP/coverage-group.txt" | tr -d ' ')
         echo "coverage_ut package_count=${selected_count} full_package_count=${package_count} package_parallelism=${COVERAGE_UT_PACKAGE_PARALLELISM} instrumented_package_count=${instrumented_package_count}" | tee -a "${phase_timing}"
-        if [ "${CS_COMPILE_CACHE_HIT:-}" = true ]; then
-          python3 .ci-workflow/scripts/cs_coverage_cache.py verify-scope \
-            --state "$RUNNER_TEMP/cs-reviewed-entry.json" --artifact "$RUNNER_TEMP/cs-reviewed-artifact" \
-            --packages "$RUNNER_TEMP/coverage-group.txt" --full-packages "$RUNNER_TEMP/coverage-full-scope.txt" \
-            --coverpkg-file "$RUNNER_TEMP/coverage-instrumented-scope.txt"
-        fi
 
         phase_start prepare_cgo
         set +e
@@ -333,9 +425,6 @@ jobs:
           timeout --kill-after=30s "${COVERAGE_UT_CGO_TIMEOUT_SECONDS}s" \
             python3 .ci-workflow/scripts/node_compile_cache.py prepare-native \
               --state "$CS_NODE_CACHE_STATE" > "${cgo_log}" 2>&1
-        elif [ "${CS_COMPILE_CACHE_HIT:-}" = true ]; then
-          timeout --kill-after=30s "${COVERAGE_UT_CGO_TIMEOUT_SECONDS}s" \
-            bash -e -c 'make config; make cgo; python3 .ci-workflow/scripts/cs_coverage_cache.py verify-native --state "$RUNNER_TEMP/cs-reviewed-entry.json" --artifact "$RUNNER_TEMP/cs-reviewed-artifact"' > "${cgo_log}" 2>&1
         else
           timeout --kill-after=30s "${COVERAGE_UT_CGO_TIMEOUT_SECONDS}s" \
             "$GITHUB_WORKSPACE/.ci-workflow/scripts/prepare_coverage_cgo.sh" > "${cgo_log}" 2>&1
@@ -368,7 +457,8 @@ jobs:
           exit "${smoke_status}"
         fi
         for required in 'TestObjectStorages/cs-s3/minio/basic' 'TestS3FSFromSpecs/cs-s3/streaming_write' 'TestCSStoragePrefixScopedInitialization'; do
-          jq -e --arg test_name "$required" 'select(.Action == "pass" and .Test == $test_name)' "$RUNNER_TEMP/cs-s3-smoke.json" >/dev/null || exit 1
+          jq -ne --arg test_name "$required" 'any(inputs; .Action == "pass" and .Test == $test_name)' \
+            "$RUNNER_TEMP/cs-s3-smoke.json" >/dev/null || exit 1
         done
         echo '- Restricted-account S3 initialization, basic and streaming smoke passed.' >> "$GITHUB_STEP_SUMMARY"
 
@@ -536,7 +626,9 @@ jobs:
         test -s "${coverage_profile}"
         if [[ "${COVERAGE_GROUP}" == '0' ]]; then
           for required in 'TestObjectStorages/cs-s3/minio/basic' 'TestS3FSFromSpecs/cs-s3/streaming_write'; do
-            jq -e --arg test_name "$required" 'select(.Action == "pass" and .Package == "github.com/matrixorigin/matrixone/pkg/fileservice" and .Test == $test_name)' "${coverage_report}" >/dev/null || {
+            jq -ne --arg test_name "$required" '
+              any(inputs; .Action == "pass" and .Package == "github.com/matrixorigin/matrixone/pkg/fileservice" and .Test == $test_name)
+            ' "${coverage_report}" >/dev/null || {
               echo "::error::Required CS S3 test did not pass: ${required}"
               exit 1
             }
@@ -657,14 +749,14 @@ jobs:
         retention-days: 7
     - id: node_cache_acceptance
       name: Fail closed on any incremental cache validation error
-      if: ${{ always() && !cancelled() && true && steps.node_cache.outcome == 'success' }}
+      if: ${{ always() && !cancelled() && steps.node_cache.outcome == 'success' }}
       timeout-minutes: 5
       run: |
         set -euo pipefail
         python3 .ci-workflow/scripts/node_compile_cache.py accept --state "$RUNNER_TEMP/cs-node-cache/state.json"
     - id: upload_node_cache_failures
       name: Upload sanitized incremental failure evidence
-      if: ${{ always() && !cancelled() && true }}
+      if: ${{ always() && !cancelled() && steps.reader.outputs.pool == 'cs' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
         name: node-cache-failures-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.group }}
@@ -679,7 +771,8 @@ jobs:
       timeout-minutes: 5
       continue-on-error: true
       env:
-        ADMISSION_OUTCOME: ${{ steps.admission.outcome }}
+        RUNNER_POOL: ${{ steps.reader.outputs.pool }}
+        VERIFY_PR_OUTCOME: ${{ steps.verify_pr.outcome }}
         BUILD_TOOLS_OUTCOME: ${{ steps.build_tools.outcome }}
         NODE_CACHE_OUTCOME: ${{ steps.node_cache.outcome }}
         COVERAGE_OUTCOME: ${{ steps.coverage_ut.outcome }}
@@ -691,8 +784,8 @@ jobs:
         preserve_status=false
         if [[ "$COVERAGE_OUTCOME" != success && "$COVERAGE_OUTCOME" != failure ]]; then
           result=failed
-          if [[ "$ADMISSION_OUTCOME" == failure ]]; then
-            reason=worker_admission_failure
+          if [[ "$VERIFY_PR_OUTCOME" == failure ]]; then
+            reason=pr_snapshot_verification_failure
           elif [[ "$BUILD_TOOLS_OUTCOME" == failure ]]; then
             reason=runner_build_dependencies_failure
           elif [[ "$NODE_CACHE_OUTCOME" == failure ]]; then
@@ -730,7 +823,7 @@ jobs:
           result=failed
           reason=coverage_profile_artifact_upload_failure
         fi
-        if [ "${result}" = 'passed' ] && [ "$CACHE_ACCEPTANCE_OUTCOME" != 'success' ]; then
+        if [ "${result}" = 'passed' ] && [ "$RUNNER_POOL" = cs ] && [ "$CACHE_ACCEPTANCE_OUTCOME" != 'success' ]; then
           result=failed
           reason=incremental_cache_validation_failure
         fi
@@ -784,7 +877,7 @@ jobs:
       continue-on-error: ${{ steps.coverage_ut.outcome == 'failure' }}
       env:
         ACTUAL_RUNNER: ${{ runner.name }}
-        STORAGE_MODE: cs-s3
+        STORAGE_MODE: ${{ steps.reader.outputs.pool == 'cs' && 'cs-s3' || 'idc-s3' }}
         COVERAGE_OUTCOME: ${{ steps.coverage_ut.outcome }}
       run: |
         set -euo pipefail
@@ -888,7 +981,7 @@ jobs:
         fi
         exit 1
     - name: Upload persistent tool recovery evidence
-      if: always()
+      if: ${{ always() && !cancelled() && steps.reader.outputs.pool == 'cs' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
         name: persistent-tools-${{ 'auto' }}-${{ inputs.group }}-${{ github.run_id }}
@@ -896,7 +989,7 @@ jobs:
         if-no-files-found: ignore
         retention-days: 7
     - name: Upload allowlisted early cache failure evidence
-      if: failure()
+      if: ${{ failure() && !cancelled() && steps.reader.outputs.pool == 'cs' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
         name: cache-failure-${{ 'auto' }}-${{ inputs.group }}-${{ github.run_id }}

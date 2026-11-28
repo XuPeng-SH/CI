@@ -1,5 +1,4 @@
 """Trusted event adapter. No dispatch, cache publication or PR-head execution."""
-import datetime as dt
 from http.client import HTTPException
 import json
 import os
@@ -70,7 +69,7 @@ def require_caller(ctx):
                     (PROJECT, "pull_request_target", RELEASE_ENTRY)), "unexpected caller")
 
 
-def route(ctx, event, live, member_status, verify_s3_fixture, *, enable_4_2_dev=False):
+def live_identity(ctx, event, live):
     require_caller(ctx)
     require(event["action"] in {"opened", "synchronize", "reopened", "ready_for_review"},
             "unexpected event action")
@@ -87,20 +86,26 @@ def route(ctx, event, live, member_status, verify_s3_fixture, *, enable_4_2_dev=
             and re.fullmatch(r"[\w.-]+/[\w.-]+", source, re.ASCII)
             and re.fullmatch(r"[\w-]+", author, re.ASCII), "stale or invalid PR identity")
     require(ctx[2] != RELEASE_ENTRY or base == RELEASE_BASE, "unexpected base for release caller")
+    return base, source, sha
+
+
+def eligible_base(base, enable_4_2_dev):
+    return base == "main" or (base == RELEASE_BASE and enable_4_2_dev)
+
+
+def route(ctx, event, live, member_status, verify_s3_fixture, *, enable_4_2_dev=False):
+    base, source, sha = live_identity(ctx, event, live)
     # The approved client never follows membership redirects. A 302 is not
     # proof of membership; like a 404 it must never grant access to cache runners.
     require(member_status in (204, 302, 404), "membership could not be verified")
     # Never use an arbitrary caller-selected head, runner label or environment.
     # Draft and PR type labels do not alter CS eligibility. The old path
     # still enforces its own org/safe-to-test eligibility.
-    # Only the standby entry accepts an explicit rollout input. The old
-    # coverage-ut.yaml@main caller does not opt in, even after this change merges.
-    cache_base = base == "main" or (base == RELEASE_BASE and enable_4_2_dev)
-    if not cache_base or live["head"]["repo"]["archived"] or member_status != 204:
+    if not eligible_base(base, enable_4_2_dev) or live["head"]["repo"]["archived"] or member_status != 204:
         return {"route": "legacy", "allowed": "false"}
     if not verify_s3_fixture(source, sha):
         return {"route": "legacy", "allowed": "false"}
-    return {"route": "cache", "allowed": "true", "head_sha": sha, "head_repository": source}
+    return {"route": "native", "allowed": "true", "head_sha": sha, "head_repository": source}
 
 
 def main():
@@ -113,37 +118,34 @@ def main():
     token = os.environ["CS_PR_METADATA_TOKEN"]
     status, pr = approved.read(f"repos/{PROJECT}/pulls/{number}", token)
     require(status == 200, "PR metadata unavailable")
-    status, checks = approved.membership(pr["user"]["login"], os.environ["CS_CACHE_READ_TOKEN"], token)
-    admitted_source = os.environ.get("COVERAGE_ADMITTED_SOURCE")
-    admitted_head = os.environ.get("COVERAGE_ADMITTED_HEAD")
+    expected = (os.environ.get("COVERAGE_EXPECTED_SOURCE"), os.environ.get("COVERAGE_EXPECTED_HEAD"))
+    verify_snapshot = expected != (None, None)
+    enable_release = os.environ.get("COVERAGE_ENABLE_4_2_DEV") == "true"
+    if verify_snapshot:
+        base, source, sha = live_identity(ctx, event, pr)
+        require((source, sha) == expected and eligible_base(base, enable_release)
+                and not pr["head"]["repo"]["archived"], "PR no longer matches authorization")
+        attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+        require(attempt.isascii() and attempt.isdecimal() and int(attempt) > 0, "invalid run attempt")
+        if attempt == "1":
+            # needs provided an authorized snapshot in this attempt. Recheck
+            # the live PR after queueing without repeating membership and fixture reads.
+            return
+
+    status, _ = approved.membership(pr["user"]["login"], os.environ["CS_CACHE_READ_TOKEN"], token)
     base = pr["base"]["ref"]
 
     def verify_fixture(source, sha):
-        if admitted_source is not None or admitted_head is not None:
-            # The trusted retry selector receives these exact values from the
-            # parent eligibility job after its fixture verification succeeds.
-            attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
-            if not (attempt.isascii() and attempt.isdecimal() and int(attempt) > 1
-                    and (source, sha) == (admitted_source, admitted_head)):
-                return False
-            if base == "main":
-                return True
+        if verify_snapshot and base == "main":
+            return True  # Reuse the verified fixture for this immutable head.
         if base == RELEASE_BASE:
             return has_s3_fixture(source, sha, token, base=base)
         return has_s3_fixture(source, sha, token)
 
-    result = route(ctx, event, pr, status, verify_fixture,
-                   enable_4_2_dev=os.environ.get("COVERAGE_ENABLE_4_2_DEV") == "true")
-    if result["route"] == "cache":
-        # Preserve the validation workflow's allowlisted, independently auditable
-        # authorization receipt; neither tokens nor the complete API payload are logged.
-        receipt = {"schema": 2, "allowed": "true", "head_sha": result["head_sha"],
-                   "head_repository": result["head_repository"], "pr_number": str(number),
-                   "base_ref": pr["base"]["ref"],
-                   "author": pr["user"]["login"], "project_cache_namespace": PROJECT,
-                   "verified_membership_http_status": status, "membership_checks": checks,
-                   "checked_at": dt.datetime.now(dt.timezone.utc).isoformat()}
-        approved.c.atomic_json(Path(os.environ["RUNNER_TEMP"]) / "real-pr-authorization.json", receipt)
+    result = route(ctx, event, pr, status, verify_fixture, enable_4_2_dev=enable_release)
+    if verify_snapshot:
+        require(result["allowed"] == "true", "PR no longer authorized for Coverage")
+        return
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as f:
         for key, value in result.items():
             print(f"{key}={value}", file=f)

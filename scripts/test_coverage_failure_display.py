@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class CoverageFailureDisplayTest(unittest.TestCase):
     def run_reporting_step(self, start, end, temp, env, preamble=""):
-        workflow = (ROOT / ".github/workflows/coverage-worker-cs.yaml").read_text()
+        workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
         block = workflow.split(start, 1)[1].split(end, 1)[0]
         script = textwrap.dedent(block.split("      run: |\n", 1)[1])
         return subprocess.run(
@@ -24,7 +24,7 @@ class CoverageFailureDisplayTest(unittest.TestCase):
         )
 
     def run_failure_step(self, temp):
-        workflow = (ROOT / ".github/workflows/coverage-worker-cs.yaml").read_text()
+        workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
         step = workflow.split("    - name: Fail on coverage UT failure\n", 1)[1]
         step = step.split("    - name: Upload persistent tool recovery evidence\n", 1)[0]
         script = textwrap.dedent(step.split("      run: |\n", 1)[1])
@@ -101,11 +101,11 @@ class CoverageFailureDisplayTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("jq"), "requires jq, installed on coverage runners")
     def test_status_keeps_the_first_failed_phase_and_fails_closed_on_its_own_checks(self):
-        defaults = dict(ADMISSION_OUTCOME="success", BUILD_TOOLS_OUTCOME="success", NODE_CACHE_OUTCOME="success",
+        defaults = dict(RUNNER_POOL="cs", VERIFY_PR_OUTCOME="success", BUILD_TOOLS_OUTCOME="success", NODE_CACHE_OUTCOME="success",
                         COVERAGE_OUTCOME="success", PROFILE_UPLOAD_OUTCOME="success", CACHE_ACCEPTANCE_OUTCOME="success")
         cases = (
-            (dict(ADMISSION_OUTCOME="failure", COVERAGE_OUTCOME="skipped", CACHE_ACCEPTANCE_OUTCOME="skipped"),
-             None, "failed", "worker_admission_failure"),
+            (dict(VERIFY_PR_OUTCOME="failure", COVERAGE_OUTCOME="skipped", CACHE_ACCEPTANCE_OUTCOME="skipped"),
+             None, "failed", "pr_snapshot_verification_failure"),
             (dict(BUILD_TOOLS_OUTCOME="failure", COVERAGE_OUTCOME="skipped"),
              None, "failed", "runner_build_dependencies_failure"),
             (dict(NODE_CACHE_OUTCOME="failure", COVERAGE_OUTCOME="skipped", CACHE_ACCEPTANCE_OUTCOME="skipped"),
@@ -119,6 +119,7 @@ class CoverageFailureDisplayTest(unittest.TestCase):
              None, "failed", "coverage_profile_artifact_upload_failure"),
             (dict(CACHE_ACCEPTANCE_OUTCOME="failure"), None, "failed", "incremental_cache_validation_failure"),
             (dict(CACHE_ACCEPTANCE_OUTCOME="skipped"), None, "failed", "incremental_cache_validation_failure"),
+            (dict(RUNNER_POOL="idc", CACHE_ACCEPTANCE_OUTCOME="skipped"), None, "passed", "command_exit"),
             ({}, {"result": "passed", "reason": "command_exit"}, "passed", "command_exit"),
         )
         for overrides, input_status, result, reason in cases:
@@ -145,7 +146,7 @@ class CoverageFailureDisplayTest(unittest.TestCase):
                 self.assertIn("No per-test skip evidence" if outcome == "failure" else "::error::", proc.stdout)
 
     def test_skip_manifest_is_still_required_and_uploaded_after_a_valid_report(self):
-        workflow = (ROOT / ".github/workflows/coverage-worker-cs.yaml").read_text()
+        workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
         upload = workflow.split("    - name: Upload skip comparison evidence\n", 1)[1].split("    - id:", 1)[0]
         self.assertIn("steps.skip_manifest.outputs.available == 'true'", upload)
         self.assertIn("if-no-files-found: error", upload)
@@ -164,15 +165,15 @@ class CoverageFailureDisplayTest(unittest.TestCase):
             self.assertFalse((temp / "output").exists())
 
     def test_compact_failure_is_ready_when_optional_tool_is_interrupted(self):
-        workflow = (ROOT / ".github/workflows/coverage-worker-cs.yaml").read_text()
+        workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
         step = workflow.split("    - name: Analyze and summarize failed coverage UT\n", 1)[1]
         step = step.split("    - name: Collect coverage UT runner diagnostics\n", 1)[0]
         script = textwrap.dedent(step.split("      run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             workspace = temp / "workspace"
-            (workspace / ".standby").mkdir(parents=True)
-            (workspace / ".standby/scripts").symlink_to(ROOT / "scripts", target_is_directory=True)
+            (workspace / ".coverage-control").mkdir(parents=True)
+            (workspace / ".coverage-control/scripts").symlink_to(ROOT / "scripts", target_is_directory=True)
             copy_step = "    - name: Preserve the trusted failure summary helper\n"
             source_step = "    - name: Checkout MatrixOne source\n"
             self.assertLess(workflow.index(copy_step), workflow.index(source_step))
@@ -200,7 +201,7 @@ class CoverageFailureDisplayTest(unittest.TestCase):
         self.assertIn("FAILED example/pkg / TestFailed", result.stdout)
 
     def test_actual_phase_producer_reports_timeouts_and_pre_report_failures(self):
-        workflow = (ROOT / ".github/workflows/coverage-worker-cs.yaml").read_text()
+        workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
         step = workflow.split("    - id: coverage_ut\n", 1)[1]
         script = textwrap.dedent(step.split("      run: |\n", 1)[1].split("    - name: Print failed coverage UT", 1)[0])
         setup = script.split('cd "$GITHUB_WORKSPACE"', 1)[0]
