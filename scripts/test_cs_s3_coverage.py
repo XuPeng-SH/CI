@@ -125,6 +125,42 @@ df() { printf 'dev 99999999 0 %s 0%% /\\n' "${TEST_DISK:-62914560}"; }
                 self.assertEqual(git_env.read_text() if git_env.exists() else "",
                                  "GOPROXY=http://cache.internal:8080\nGOTOOLCHAIN=local\n" if pool else "")
 
+    def test_go_toolchain_prefers_local_copies_and_uses_the_site_proxy_on_a_miss(self):
+        script = step_script("go_toolchain")
+        for cached, mirror_available in ((True, False), (False, True), (False, False)):
+            with self.subTest(cached=cached, mirror_available=mirror_available), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "go.mod").write_text("module example\ngo 1.27.1\n")
+                bootstrap = root / "bin"
+                bootstrap.mkdir()
+                toolcache = root / "installed"
+                selected = toolcache / "go/1.27.1/x64" if cached else root / "resolved"
+                (selected / "bin").mkdir(parents=True)
+                (selected / "bin/go").write_text('#!/bin/bash\n'
+                    f'if [[ "$2" == GOROOT ]]; then echo {shlex.quote(str(selected))}; else echo go1.27.1; fi\n')
+                (selected / "bin/go").chmod(0o755)
+                (bootstrap / "go").write_text(r"""#!/bin/bash
+if [[ "$GOTOOLCHAIN" == local ]]; then
+  echo go1.26.4
+elif [[ "$GOTOOLCHAIN" == go1.27.1 && "$GOPROXY" == http://cache.internal &&
+        "$GOMODCACHE" == "$RUNNER_TEMP/coverage-go-toolchain" && "$MIRROR_AVAILABLE" == yes ]]; then
+  echo "$RUNNER_TEMP/resolved"
+else
+  exit 42
+fi
+""")
+                (bootstrap / "go").chmod(0o755)
+                output = root / "github-env"
+                env = dict(PATH=f'{bootstrap}:{os.environ["PATH"]}', GITHUB_ENV=str(output),
+                           GITHUB_PATH=str(root / "github-path"), RUNNER_TEMP=tmp,
+                           RUNNER_TOOL_CACHE=str(toolcache), GOTOOLCHAIN="local", GOPROXY="http://cache.internal",
+                           MIRROR_AVAILABLE="yes" if mirror_available else "no")
+                result = subprocess.run(["bash", "-c", script], cwd=root, env=env, capture_output=True, text=True)
+                valid = cached or mirror_available
+                self.assertEqual(result.returncode, 0 if valid else 42, result.stderr)
+                self.assertEqual(output.read_text() if output.exists() else "",
+                                 f"GOROOT={selected}\n" if valid else "")
+
     def test_storage_fixture_requires_one_line_and_uses_attempt_prefix(self):
         script = step_script("coverage_ut").split('coverage_profile="', 1)[0]
         cases = (

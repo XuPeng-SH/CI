@@ -147,7 +147,8 @@ jobs:
         set -euo pipefail
         python3 .ci-workflow/scripts/node_cache_toolchain_store.py --catalog .ci-workflow/config/node-compile-cache-catalog.json --lock .ci-workflow/config/node-toolchain-lock.json --destination "$RUNNER_TEMP/node-toolchain-install" --report "$RUNNER_TEMP/persistent-toolchain.json"
     - id: go_toolchain
-      name: Select the preinstalled Go version declared by the source
+      name: Select the Go version declared by the source
+      timeout-minutes: 5
       run: |
         set -euo pipefail
         required=$(awk '$1 == "go" { print $2; exit }' go.mod)
@@ -155,16 +156,24 @@ jobs:
           echo '::error::Coverage requires a pinned Go toolchain version in go.mod'
           exit 1
         fi
-        selected=$(command -v go || true)
-        if [[ -z "$selected" || "$(env -u GOROOT "$selected" env GOVERSION)" != "go$required" ]]; then
-          selected="$RUNNER_TOOL_CACHE/go/$required/x64/bin/go"
+        installed=$(env -u GOROOT go env GOVERSION 2>/dev/null || true)
+        cached="$RUNNER_TOOL_CACHE/go/$required/x64/bin/go"
+        if [[ "$installed" == "go$required" ]]; then
+          selected=$(env -u GOROOT go env GOROOT)
+        elif [[ -x "$cached" ]]; then
+          selected=$(env -u GOROOT "$cached" env GOROOT)
+        else
+          # Go verifies the toolchain module through the site proxy and sumdb.
+          # Keep it out of the reviewed compile-cache paths.
+          selected=$(env -u GOROOT GOTOOLCHAIN="go$required" \
+            GOMODCACHE="$RUNNER_TEMP/coverage-go-toolchain" go env GOROOT)
         fi
-        if [[ ! -x "$selected" || "$(env -u GOROOT "$selected" env GOVERSION)" != "go$required" ]]; then
-          echo "::error::Go $required is missing from this Coverage runner image and tool cache"
+        if ! [[ -x "$selected/bin/go" && "$(env -u GOROOT "$selected/bin/go" env GOVERSION)" == "go$required" ]]; then
+          echo "::error::Expected Go $required on the Coverage worker"
           exit 1
         fi
-        printf 'GOROOT=%s\n' "$(env -u GOROOT "$selected" env GOROOT)" >> "$GITHUB_ENV"
-        dirname "$selected" >> "$GITHUB_PATH"
+        printf 'GOROOT=%s\n' "$selected" >> "$GITHUB_ENV"
+        printf '%s/bin\n' "$selected" >> "$GITHUB_PATH"
     - name: Configure the site-local Python dependency mirror
       if: ${{ hashFiles('pkg/udf/python/worker/requirements.txt') != '' }}
       run: |

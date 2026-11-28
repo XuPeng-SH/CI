@@ -19,7 +19,8 @@ capacity must be verified at both sites before enabling the shared route.
   node PVC. Each job gets private incremental writes. Shanghai builds with
   job-local caches and a site-local Go module proxy.
 - Each site supplies one HTTP(S) `MO_COVERAGE_GOPROXY`. The proxy owns upstream
-  fetch concurrency, cache lifetime and Go checksum-service forwarding. Use a
+  fetch concurrency, cache lifetime and Go checksum-service forwarding. Go
+  toolchain misses use the same proxy with built-in verification. Use a
   single site-local `MO_COVERAGE_PIP_INDEX_URL` for jobs with Python UDFs.
 - Preload the Go versions from both branches and the matching Python 3.12 tool
   cache, CGo build tools and verified ONNX runtime. Publish images through the
