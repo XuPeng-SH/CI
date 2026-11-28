@@ -15,6 +15,9 @@ self-hosted-runner:
     - mac-arm64-mini
 
 paths:
+  .github/workflows/coverage-release-storage.yaml:
+    ignore:
+      - 'property "workflow_sha" is not defined'
   .github/workflows/coverage-worker.yaml:
     ignore:
       - 'property "workflow_sha" is not defined'

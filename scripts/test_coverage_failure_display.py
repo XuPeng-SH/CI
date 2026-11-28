@@ -26,7 +26,6 @@ class CoverageFailureDisplayTest(unittest.TestCase):
     def run_failure_step(self, temp):
         workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
         step = workflow.split("    - name: Fail on coverage UT failure\n", 1)[1]
-        step = step.split("    - name: Upload persistent tool recovery evidence\n", 1)[0]
         script = textwrap.dedent(step.split("      run: |\n", 1)[1])
         return subprocess.run(["bash", "-e", "-c", script], env={**os.environ, "RUNNER_TEMP": str(temp)},
                               text=True, capture_output=True, check=False)
@@ -164,11 +163,8 @@ class CoverageFailureDisplayTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 9)
             self.assertFalse((temp / "output").exists())
 
-    def test_compact_failure_is_ready_when_optional_tool_is_interrupted(self):
+    def test_failure_evidence_keeps_the_first_error_and_bounds_uploads(self):
         workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
-        step = workflow.split("    - name: Analyze and summarize failed coverage UT\n", 1)[1]
-        step = step.split("    - name: Collect coverage UT runner diagnostics\n", 1)[0]
-        script = textwrap.dedent(step.split("      run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             workspace = temp / "workspace"
@@ -180,30 +176,35 @@ class CoverageFailureDisplayTest(unittest.TestCase):
             copy_cmd = workflow.split(copy_step, 1)[1].split("      run: ", 1)[1].splitlines()[0]
             subprocess.run(["bash", "-ec", copy_cmd], cwd=workspace,
                            env={**os.environ, "RUNNER_TEMP": str(temp)}, check=True)
-            # actions/checkout clears the root here because it has no root .git.
+            # Source checkout clears the old worktree.
             shutil.rmtree(workspace)
             workspace.mkdir()
-            (temp / "ut-coverage-status.json").write_text('{"result":"failed"}')
             (temp / "ut-coverage-report.json").write_text(json.dumps({
                 "Action": "fail", "Package": "example/pkg", "Test": "TestFailed"
             }) + "\n")
-            # Simulate termination while attempting the optional install.
-            go_stub = 'go() { [[ -s "$RUNNER_TEMP/ut-failure-compact.txt" ]] || exit 97; exit 124; }\n'
-            interrupted = subprocess.run(
-                ["bash", "-e", "-c", go_stub + script],
-                env={**os.environ, "RUNNER_TEMP": str(temp), "GITHUB_WORKSPACE": str(workspace),
-                     "GITHUB_STEP_SUMMARY": str(temp / "summary.md")},
-                text=True, capture_output=True, check=False,
+            stderr = temp / "ut-coverage.stderr.log"
+            stderr.write_text("noise\n" * 24000 + "last runner error\n")
+            (temp / "ut-coverage-cgo.log").symlink_to(stderr)
+            reports = self.run_reporting_step(
+                "    - name: Collect bounded Coverage failure evidence\n",
+                "    - id: upload_coverage_profile\n",
+                temp, dict(GITHUB_WORKSPACE=str(workspace)),
+                preamble="go() { exit 87; }\nsudo() { exit 88; }\n",
             )
             result = self.run_failure_step(temp)
-        self.assertEqual(interrupted.returncode, 124, interrupted.stderr)
+            bundle = temp / "coverage-failure"
+            self.assertEqual(reports.returncode, 0, reports.stderr)
+            self.assertEqual((bundle / stderr.name).stat().st_size, 65536)
+            self.assertTrue((bundle / stderr.name).read_text().endswith("last runner error\n"))
+            self.assertFalse((bundle / "ut-coverage-cgo.log").exists())
+            self.assertFalse((bundle / "ut-coverage-report.json").exists())
         self.assertEqual(result.returncode, 1)
         self.assertIn("FAILED example/pkg / TestFailed", result.stdout)
 
     def test_actual_phase_producer_reports_timeouts_and_pre_report_failures(self):
         workflow = (ROOT / ".github/workflows/coverage-worker.yaml").read_text()
         step = workflow.split("    - id: coverage_ut\n", 1)[1]
-        script = textwrap.dedent(step.split("      run: |\n", 1)[1].split("    - name: Print failed coverage UT", 1)[0])
+        script = textwrap.dedent(step.split("      run: |\n", 1)[1].split("    - name: Collect bounded Coverage failure evidence", 1)[0])
         setup = script.split('cd "$GITHUB_WORKSPACE"', 1)[0]
         phases = "phase_start() {" + script.split("phase_start() {", 1)[1].split("\nphase_start discover_packages", 1)[0]
         for phase, code, command in (

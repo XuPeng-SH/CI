@@ -21,8 +21,6 @@ on:
       - 'scripts/test_select_coverage_artifacts.py'
       - 'scripts/test_coverage_native_runtime.py'
       - 'scripts/test_cs_s3_coverage.py'
-      - 'scripts/coverage_cs_build_tools.sh'
-      - 'scripts/test_coverage_cs_build_tools.py'
       - 'scripts/coverage_pr_entry.py'
       - 'scripts/test_coverage_pr_entry.py'
       - 'scripts/testdata/coverage_4_2_fixture.json'
@@ -132,7 +130,7 @@ jobs:
                    {key: .name, value: .sha}) | from_entries) == $expected'
       - name: Test Coverage runner, storage and PR authorization
         timeout-minutes: 3
-        run: python3 -m unittest scripts.test_cs_s3_coverage scripts.test_coverage_cs_build_tools scripts.test_coverage_pr_entry -v
+        run: python3 -m unittest scripts.test_cs_s3_coverage scripts.test_coverage_pr_entry -v
       - name: Test Coverage UT failure display
         run: python3 -m unittest scripts.test_coverage_failure_display -v
       - name: Test TKE merge subject identity contract

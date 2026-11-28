@@ -1,0 +1,144 @@
+name: Release Coverage storage providers
+on:
+  workflow_call:
+    inputs:
+      source: {type: string, required: true}
+      head: {type: string, required: true}
+    outputs:
+      profile:
+        value: ${{ jobs.provider.outputs.profile }}
+    secrets:
+      COVERAGE_PR_READ_TOKEN: {required: true}
+      TEST_S3FS_ALIYUN: {required: false}
+      TEST_S3FS_QCLOUD: {required: false}
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  provider:
+    name: OSS and COS Coverage on Shanghai IDC
+    if: >-
+      github.repository == 'matrixorigin/matrixone' && github.event_name == 'pull_request_target' &&
+      github.base_ref == '4.2-dev' &&
+      (github.workflow_ref == 'matrixorigin/matrixone/.github/workflows/entrypoint.yaml@refs/heads/main' ||
+      github.workflow_ref == 'matrixorigin/matrixone/.github/workflows/entrypoint.yaml@refs/heads/4.2-dev')
+    runs-on: amd64-mo-shanghai-ut-safe
+    timeout-minutes: 90
+    env:
+      GOPROXY: http://goproxy.goproxy.svc.cluster.local
+      GOTOOLCHAIN: local
+    permissions:
+      contents: read
+    outputs:
+      profile: ${{ steps.profile.outputs.artifact-id }}
+    steps:
+    - name: Verify Shanghai runner isolation before checkout
+      env:
+        ASSIGNED: ${{ runner.name }}
+      run: |
+        set -eu
+        if ! [[ "$ASSIGNED" == amd64-mo-shanghai-ut-safe-*-runner-* && "$(uname -m)" == x86_64 ]]; then
+          echo '::error::Unexpected runner for OSS and COS Coverage'
+          exit 1
+        fi
+        for path in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/docker.sock /run/containerd/containerd.sock; do
+          if test -e "$path" || test -L "$path"; then
+            echo "::error::Shanghai test runner exposes $path"
+            exit 1
+          fi
+        done
+    - if: github.run_attempt > 1
+      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      timeout-minutes: 5
+      with:
+        repository: matrixorigin/CI
+        ref: ${{ job.workflow_sha }}
+        path: coverage-tools
+        sparse-checkout: scripts/coverage_pr_entry.py
+        sparse-checkout-cone-mode: false
+        persist-credentials: false
+    - if: github.run_attempt > 1
+      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      timeout-minutes: 5
+      with:
+        repository: matrixorigin/CI
+        ref: 7a8cf1854da5ca4cc5ffb5a1f2cbc454162ad589
+        path: reviewed
+        sparse-checkout: |
+          scripts
+          config
+        persist-credentials: false
+    - name: Reauthorize the exact release PR before retrying
+      if: github.run_attempt > 1
+      timeout-minutes: 3
+      env:
+        CS_PR_METADATA_TOKEN: ${{ secrets.COVERAGE_PR_READ_TOKEN }}
+        CS_CACHE_READ_TOKEN: ${{ github.token }}
+        COVERAGE_EXPECTED_SOURCE: ${{ inputs.source }}
+        COVERAGE_EXPECTED_HEAD: ${{ inputs.head }}
+        COVERAGE_ENABLE_4_2_DEV: ${{ true }}
+      run: PYTHONPATH="$GITHUB_WORKSPACE/reviewed/scripts" python3 coverage-tools/scripts/coverage_pr_entry.py
+    - name: Checkout authorized MatrixOne head
+      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      timeout-minutes: 10
+      with:
+        repository: ${{ inputs.source }}
+        ref: ${{ inputs.head }}
+        path: matrixone
+        persist-credentials: false
+    - uses: matrixorigin/CI/actions/setup-env@5fc75d89bc2841e50ae1557d28ebd9aaec6ec3e2
+      timeout-minutes: 10
+      with:
+        setup-java: false
+        setup-cmake: false
+        go-version-file: matrixone/go.mod
+    - name: Prepare Coverage CGo libraries
+      timeout-minutes: 30
+      working-directory: matrixone
+      run: make cgo
+    - id: test_storage_providers
+      name: Test OSS and COS
+      timeout-minutes: 22
+      working-directory: matrixone
+      env:
+        TEST_S3FS_ALIYUN: ${{ secrets.TEST_S3FS_ALIYUN }}
+        TEST_S3FS_QCLOUD: ${{ secrets.TEST_S3FS_QCLOUD }}
+      run: |
+        set -euo pipefail
+        if [[ -z "$TEST_S3FS_ALIYUN" || -z "$TEST_S3FS_QCLOUD" ]]; then
+          echo '::error::Release Coverage requires both OSS and COS configurations'
+          exit 1
+        fi
+        unset endpoint region apikey apisecret bucket TEST_S3FS_CS
+        export CGO_CFLAGS="-I$PWD/cgo -I$PWD/thirdparties/install/include"
+        export CGO_LDFLAGS="-L$PWD/cgo -lmo -Wl,-rpath,$PWD/cgo -L$PWD/thirdparties/install/lib -lusearch_c -Wl,-rpath,$PWD/thirdparties/install/lib -lm"
+        report="$RUNNER_TEMP/release-storage-test.json"
+        go test -mod=readonly -count=1 -short -json -tags matrixone_test -timeout=20m \
+          -covermode=set -coverprofile="$RUNNER_TEMP/ut-coverage.out" ./pkg/fileservice > "$report" || {
+          status=$?
+          jq -r '.Output // empty' "$report" >&2 || true
+          exit "$status"
+        }
+        # The SDK pass identifies the provider and the tested fixture name.
+        # Match that same fixture in the S3FS tests regardless of its name.
+        for sdk in aliyun qcloud; do
+          jq -ne --arg sdk "$sdk" '
+            [inputs | select(.Action == "pass" and .Package == "github.com/matrixorigin/matrixone/pkg/fileservice")
+                    | .Test | strings] as $passed
+            | any($passed[] | capture("^TestObjectStorages/(?<fixture>.+)/" + $sdk + "/basic$");
+                  ("TestS3FSFromSpecs/" + .fixture + "/streaming_write") as $stream
+                  | ($passed | index($stream)) != null)
+          ' "$report" >/dev/null || {
+            echo "::error::Missing passing basic and streaming write tests for $sdk"
+            exit 1
+          }
+        done
+        echo 'OSS and COS basic and streaming write tests passed.'
+    - id: profile
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      timeout-minutes: 5
+      with:
+        name: ut-coverage-release-storage-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/ut-coverage.out
+        if-no-files-found: error
+        retention-days: 7

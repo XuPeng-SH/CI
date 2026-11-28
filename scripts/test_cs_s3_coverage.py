@@ -14,7 +14,7 @@ import unittest
 DIRECTORY = Path(__file__).parents[1] / ".github/workflows"
 ENTRY = (DIRECTORY / "coverage-ut.yaml").read_text()
 WORKFLOW = (DIRECTORY / "coverage-worker.yaml").read_text()
-STACKS = ("mty", "mnl2", "jed", "ruh")
+RELEASE = (DIRECTORY / "coverage-release-storage.yaml").read_text()
 
 
 def step_script(step, source=None):
@@ -54,28 +54,37 @@ class CSS3CoverageTest(unittest.TestCase):
         self.assertLess(WORKFLOW.index("- id: verify_pr"), WORKFLOW.index("name: Checkout MatrixOne source"))
         self.assertNotRegex(WORKFLOW + ENTRY, r"workflow_dispatch|actions: write|runs/(?=\$|\{)")
         self.assertIn("COVERAGE_UT_PACKAGE_PARALLELISM: '7'", WORKFLOW)
+        self.assertIn("runs-on: matrixone-coverage-x86", WORKFLOW)
+        self.assertNotIn("environment: ci", WORKFLOW)
+        for secret in ("TOKEN_ACTION", "CS_S3_", "S3API", "S3BUCKET"):
+            self.assertNotIn(secret, WORKFLOW + group)
+        self.assertIn("COVERAGE_PR_READ_TOKEN", group)
 
     def test_runner_assignment_checks_both_pools_before_checkout(self):
         cs = "cs-jed-nc-n0-pr-v1-abc-runner-def"
         idc = "amd64-mo-shanghai-ut-safe-abc-runner-def"
         cases = (
-            (cs, "cs", {}, "cs", "jed"), (cs, "shared", {}, "cs", "jed"),
-            (cs.replace("jed", "mty"), "shared", {"CS_CACHE_ENV": "mty"}, "cs", "mty"),
-            (cs.replace("jed", "mnl2"), "shared", {"CS_CACHE_ENV": "mnl2"}, "cs", "mnl2"),
-            (cs.replace("jed", "ruh"), "shared", {"CS_CACHE_ENV": "ruh"}, "cs", "ruh"),
-            (idc, "idc", {}, "idc", "shanghai"), (idc, "shared", {}, "idc", "shanghai"),
-            (cs, "idc", {}, None, None), (idc, "cs", {}, None, None),
-            (cs, "shared", {"CS_CACHE_ENV": "ruh"}, None, None),
-            (cs, "shared", {"CS_CACHE_EXPECTED_NODE": "mo-standard-1"}, None, None),
-            (cs.replace("jed-nc-n0", "mty-nc-n2"), "shared",
+            (cs, {}, "cs", "jed"),
+            (cs.replace("jed", "mty"), {"CS_CACHE_ENV": "mty"}, "cs", "mty"),
+            (cs.replace("jed", "mnl2"), {"CS_CACHE_ENV": "mnl2"}, "cs", "mnl2"),
+            (cs.replace("jed", "ruh"), {"CS_CACHE_ENV": "ruh"}, "cs", "ruh"),
+            (idc, {}, "idc", "shanghai"),
+            (cs, {"CS_CACHE_ENV": "ruh"}, None, None),
+            (cs, {"CS_CACHE_EXPECTED_NODE": "mo-standard-1"}, None, None),
+            (cs.replace("jed-nc-n0", "mty-nc-n2"),
              dict(CS_CACHE_ENV="mty", CS_CACHE_NODE="mo-standard-2", CS_CACHE_EXPECTED_NODE="mo-standard-2"), None, None),
-            (idc, "shared", {"TEST_UID": "0"}, None, None),
-            (idc, "shared", {"TEST_DISK": "62914559"}, None, None),
-            (idc, "shared", {"TEST_SUDO_STATUS": "0"}, None, None),
-            (idc, "shared", {"EXPOSED_FILE": "token"}, None, None),
-            (idc, "shared", {"EXPOSED_FILE": "docker.sock"}, None, None),
-            (idc, "shared", {"EXPOSED_FILE": "containerd.sock"}, None, None),
-            ("unknown", "shared", {}, None, None),
+            (idc, {"TEST_UID": "0"}, None, None),
+            (idc, {"TEST_DISK": "62914559"}, None, None),
+            (idc, {"TEST_SUDO_STATUS": "0"}, None, None),
+            (idc, {"EXPOSED_FILE": "token"}, None, None),
+            (idc, {"EXPOSED_FILE": "docker.sock"}, None, None),
+            (idc, {"EXPOSED_FILE": "containerd.sock"}, None, None),
+            (idc, {"MO_COVERAGE_GOPROXY": ""}, None, None),
+            (idc, {"MO_COVERAGE_GOPROXY": "https://cache.internal|direct"}, None, None),
+            (cs, {"MO_COVERAGE_GOPROXY": "https://cache.internal,https://elsewhere"}, None, None),
+            (cs, {"MO_COVERAGE_GOPROXY": "https://cache.internal\nINJECTED=yes"}, None, None),
+            (cs, {"MISSING_FIXTURE": "yes"}, None, None),
+            ("unknown", {}, None, None),
         )
         script = """
 uname() { echo x86_64; }
@@ -87,11 +96,15 @@ df() { printf 'dev 99999999 0 %s 0%% /\\n' "${TEST_DISK:-62914560}"; }
                       "/var/run/docker.sock", "/run/containerd/containerd.sock")
         for path in host_paths:
             self.assertIn(path, script)
-        for runner, requested, extra, pool, site in cases:
-            with self.subTest(runner=runner, requested=requested, extra=extra), tempfile.TemporaryDirectory() as tmp:
+        for runner, extra, pool, site in cases:
+            with self.subTest(runner=runner, extra=extra), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 output = root / "output"
-                isolated = script
+                git_env = root / "env"
+                fixture_file = root / "coverage-s3"
+                if "MISSING_FIXTURE" not in extra:
+                    fixture_file.touch()
+                isolated = script.replace("/etc/matrixone-ci/coverage-s3", shlex.quote(str(fixture_file)))
                 for path in host_paths:
                     fixture = root / Path(path).name
                     isolated = isolated.replace(path, shlex.quote(str(fixture)))
@@ -100,7 +113,8 @@ df() { printf 'dev 99999999 0 %s 0%% /\\n' "${TEST_DISK:-62914560}"; }
                             fixture.symlink_to(root / "missing")
                         else:
                             fixture.touch()
-                env = dict(PATH=os.environ["PATH"], ACTUAL_RUNNER=runner, REQUESTED_POOL=requested,
+                env = dict(PATH=os.environ["PATH"], ACTUAL_RUNNER=runner, GITHUB_ENV=str(git_env),
+                           MO_COVERAGE_GOPROXY="http://cache.internal:8080",
                            CS_CACHE_ENV="jed", CS_CACHE_NODE="mo-standard-0", CS_CACHE_EXPECTED_NODE="mo-standard-0",
                            GITHUB_OUTPUT=str(output), GITHUB_WORKSPACE=tmp, GITHUB_STEP_SUMMARY=str(root / "summary"))
                 result = subprocess.run(["bash", "-c", isolated], env={**env, **extra}, capture_output=True)
@@ -108,46 +122,48 @@ df() { printf 'dev 99999999 0 %s 0%% /\\n' "${TEST_DISK:-62914560}"; }
                 self.assertEqual(output.read_text() if output.exists() else "",
                                  f"pool={pool}\nsite={site}\n" if pool else "")
 
-    def test_cs_credentials_are_selected_only_for_the_assigned_site(self):
-        value = re.search(r"TEST_S3FS_CS: >-\n\s*\$\{\{(.*?)\}\}", WORKFLOW, re.S)[1]
-        for site in (*STACKS, "shanghai"):
-            for missing in (False, True):
-                with self.subTest(site=site, missing=missing):
-                    expr = " ".join(value.split()).replace("steps.reader.outputs.site", repr(site))
-                    for stack in STACKS:
-                        expr = expr.replace(f"secrets.CS_S3_{stack.upper()}_CONFIG", repr("" if missing and stack == site else stack))
-                    self.assertEqual(eval(expr.replace("&&", " and ").replace("||", " or "), {"__builtins__": {}}),
-                                     site if site in STACKS and not missing else "")
-        for field in ("IDC_ENDPOINT", "IDC_REGION", "IDC_BUCKET", "IDC_KEY", "IDC_SECRET"):
-            self.assertRegex(WORKFLOW, rf"{field}: \$\{{\{{ steps.reader.outputs.pool == 'idc' && secrets\.")
+                self.assertEqual(git_env.read_text() if git_env.exists() else "",
+                                 "GOPROXY=http://cache.internal:8080\nGOTOOLCHAIN=local\n" if pool else "")
 
-    def test_storage_fixture_rejects_missing_credentials_before_ut_and_uses_attempt_prefix(self):
+    def test_storage_fixture_requires_one_line_and_uses_attempt_prefix(self):
         script = step_script("coverage_ut").split('coverage_profile="', 1)[0]
-        for pool, site, missing, attempt in (("cs", "jed", False, "1"), ("cs", "jed", True, "2"),
-                                              ("idc", "shanghai", False, "2"), ("idc", "shanghai", True, "1")):
-            with self.subTest(pool=pool, missing=missing, attempt=attempt), tempfile.TemporaryDirectory() as tmp:
-                summary = Path(tmp) / "summary"
+        cases = (
+            ("cs", "jed", "name=cs,key-secret=fixture", "1", True),
+            ("idc", "shanghai", "name=cs,key-secret=fixture\n", "2", True),
+            ("cs", "jed", "", "2", False),
+            ("idc", "shanghai", "name=cs\nkey-secret=fixture", "2", False),
+        )
+        for pool, site, data, attempt, valid in cases:
+            with self.subTest(pool=pool, attempt=attempt, valid=valid), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                summary = root / "summary"
+                fixture = root / "fixture"
+                fixture.write_text(data)
+                stub = "echo() { if [[ \"$1\" == ::add-mask::* ]]; then return 0; fi; builtin echo \"$@\"; }\n"
+                isolated = script.replace("/etc/matrixone-ci/coverage-s3", shlex.quote(str(fixture)))
                 env = dict(PATH=os.environ["PATH"], RUNNER_TEMP=tmp, GITHUB_WORKSPACE=tmp, GITHUB_STEP_SUMMARY=str(summary),
-                           GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT=attempt, CS_CACHE_ENV=site, RUNNER_POOL=pool,
-                           RUNNER_SITE=site, TEST_S3FS_CS="opaque-test-value" if pool == "cs" and not missing else "",
-                           IDC_ENDPOINT="https://fixture.invalid", IDC_REGION="region", IDC_BUCKET="bucket",
-                           IDC_KEY="fixture-key", IDC_SECRET="" if missing else "opaque-test-value", COVERAGE_GROUP="0",
-                           endpoint="legacy", TEST_S3FS_ALIYUN="legacy", TEST_S3FS_QCLOUD="legacy")
-                result = subprocess.run(["bash", "-c", script + '\ntest -z "${endpoint+x}${TEST_S3FS_ALIYUN+x}${TEST_S3FS_QCLOUD+x}"'],
-                                        env=env, capture_output=True, text=True)
-                self.assertEqual(result.returncode == 0, not missing, result.stderr)
-                self.assertNotIn("opaque-test-value", result.stdout + result.stderr)
-                if not missing:
-                    details = summary.read_text()
-                    self.assertIn(f"ci-ut/123-{attempt}/group-0", details)
-                    self.assertNotIn("opaque-test-value", details)
+                           GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT=attempt, RUNNER_POOL=pool,
+                           RUNNER_SITE=site, COVERAGE_GROUP="0", endpoint="legacy", TEST_S3FS_ALIYUN="legacy",
+                           TEST_S3FS_QCLOUD="legacy", CS_NODE_CACHE_STATE="test")
+                result = subprocess.run(
+                    ["bash", "-c", stub + isolated + '\ntest -z "${endpoint+x}${TEST_S3FS_ALIYUN+x}${TEST_S3FS_QCLOUD+x}"'],
+                    env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, valid, result.stderr)
+                self.assertNotIn("key-secret", result.stdout + result.stderr)
+                if valid:
+                    self.assertIn(f"ci-ut/123-{attempt}/group-0", summary.read_text())
 
     def test_release_storage_uses_shanghai_and_the_authorized_head(self):
         job = ENTRY.split("\n  release-storage-coverage:\n")[1].split("\n  merge-coverage-groups:\n")[0]
-        self.assertIn("runs-on: amd64-mo-shanghai-ut-safe", job)
+        self.assertIn("uses: ./.github/workflows/coverage-release-storage.yaml", job)
+        self.assertIn("runs-on: amd64-mo-shanghai-ut-safe", RELEASE)
+        self.assertNotIn("TOKEN_ACTION", RELEASE)
+        self.assertNotIn("environment: ci", RELEASE)
         self.assertIn("github.base_ref == '4.2-dev' && inputs.enable_4_2_dev", job)
         self.assertIn("needs.check_coverage_eligibility.outputs.allowed == 'true'", job)
-        self.assertIn("ref: ${{ needs.check_coverage_eligibility.outputs.head_sha }}", job)
+        self.assertIn("head: ${{ needs.check_coverage_eligibility.outputs.head_sha }}", job)
+        self.assertIn("ref: ${{ inputs.head }}", RELEASE)
+        job = RELEASE
         self.assertLess(job.index("Verify Shanghai runner isolation"), job.index("Checkout authorized MatrixOne head"))
         self.assertLess(job.index("Reauthorize the exact release PR"), job.index("Checkout authorized MatrixOne head"))
         retry = job.split("name: Reauthorize the exact release PR")[1].split("Checkout authorized MatrixOne head")[0]
@@ -157,7 +173,7 @@ df() { printf 'dev 99999999 0 %s 0%% /\\n' "${TEST_DISK:-62914560}"; }
         self.assertIn("artifact-ids: ${{ needs.release-storage-coverage.outputs.profile }}", ENTRY)
 
     def test_release_provider_coverage_requires_actual_provider_passes(self):
-        script = step_script("test_storage_providers", ENTRY)
+        script = step_script("test_storage_providers", RELEASE)
         package = "github.com/matrixorigin/matrixone/pkg/fileservice"
         passed = [dict(Action="pass", Package=package, Test=name) for name in (
             "TestObjectStorages/oss_eu/storage/aliyun/basic",
